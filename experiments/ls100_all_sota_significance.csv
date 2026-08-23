@@ -1,0 +1,15 @@
+method,metric,status,n_method,n_fowac,fowac_minus_method,ci_low,ci_high,welch_p,mannwhitney_p
+TEEN,inc,estimable-paired,10,10,0.030041675,-0.0026333999999999,0.064316675625,0.1299090694414884,0.130859375
+OFCL,inc,estimable-independent-seeds,10,50,0.20704000833333325,0.18537831329166668,0.2298300252499999,3.74977091278185e-14,1.0109698954494258e-06
+OPCR,inc,estimable-independent-seeds,10,50,0.2824233416666667,0.26558234666666675,0.2975475307499999,1.994698759864599e-37,7.383566114695932e-07
+YLOC,inc,estimable-independent-seeds,10,50,0.19339834166666658,0.1739110485416669,0.21136118562499984,1.3290295313836394e-19,9.142137431628699e-07
+Happy,inc,estimable-independent-seeds,10,50,0.340519175,0.321924567875,0.3585293737916667,3.788406763440172e-29,7.462282849847284e-07
+CAMP,inc,not-estimable: no LS-100 acoustic result,0,50,,,,,
+MetaGCD,inc,not-estimable: no LS-100 acoustic result,0,50,,,,,
+OCGCD/DEAN,inc,not-estimable: no LS-100 acoustic result,0,50,,,,,
+OpenIncrement,inc,not-estimable: no LS-100 acoustic result,0,50,,,,,
+VB-CGCD,inc,not-estimable: no LS-100 acoustic result,0,50,,,,,
+FaE,inc,not-estimable: no LS-100 acoustic result,0,50,,,,,
+PRISM,inc,not-estimable: no LS-100 acoustic result,0,50,,,,,
+OCCD,inc,not-estimable: no LS-100 acoustic result,0,50,,,,,
+VC-CGCD,inc,not-estimable: no LS-100 acoustic result,0,50,,,,,

@@ -1,0 +1,4 @@
+method,dataset,seed,base_acc,old_aa,novel_aa,inc_aa,all_aa,final_inc,final_all,status,source
+VB-CGCD official-transfer,LS-100,seed3420_v2,0.898625,0.008350533195734434,0.05,0.10416666666666667,0.010850533195734435,0.05,0.01,numerically-collapsed,artifacts/vbcgcd_formal/ls100/seed3420_v2/metrics.json
+VB-CGCD official-transfer,NS-100,seed3420_v2,0.0125,0.005902777777777778,0.1,0.05416666666666667,0.010850533195734435,0.05,0.01,numerically-collapsed,artifacts/vbcgcd_formal/ns100/seed3420_v2/metrics.json
+VB-CGCD official-transfer,FSC-89,seed3420_v2,0.014492753623188406,0.006354568854568855,0.1,0.10416666666666667,0.012328114580639114,0.05,0.011235955056179777,numerically-collapsed,artifacts/vbcgcd_formal/fsc89/seed3420_v2/metrics.json

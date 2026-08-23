@@ -1,0 +1,53 @@
+{
+  "per_session": {
+    "inc_acc": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "all_acc": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "acc_known": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "acc_unknown": [
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "AA_inc": 0.0,
+  "AA_all": 0.0,
+  "AA_known": 0.0,
+  "AA_unknown": 1.0,
+  "PD_inc": 1.0,
+  "PD_all": 1.0,
+  "bins": {
+    "0-79": {
+      "inc_acc": 0.0,
+      "all_acc": 0.0,
+      "acc_known": 0.0,
+      "acc_unknown": 1.0
+    },
+    "90-94": {
+      "inc_acc": 0.0,
+      "all_acc": 0.0,
+      "acc_known": 0.0,
+      "acc_unknown": 1.0
+    }
+  },
+  "AUROC": 0.5,
+  "FPR95": 1.0,
+  "session0_acc": 0.680625,
+  "method": "openmax",
+  "dataset": "librispeech"
+}

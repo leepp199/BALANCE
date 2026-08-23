@@ -1,0 +1,31 @@
+# Python/runtime caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local environments and downloaded model/data caches
+.offline_torch/
+.cache/
+artifacts/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+
+# Large/generated experiment outputs
+logs/
+save_result/
+repro_baselines/results/
+figures/
+outputs/
+wandb/
+tensorboard/
+*.log
+*.out
+
+# Local editor/OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
