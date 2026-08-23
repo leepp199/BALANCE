@@ -22,6 +22,7 @@ figures/
 outputs/
 third_party/
 repro_baselines/official_code/
+paper/
 *.docx
 *.bak
 extract_log.txt
