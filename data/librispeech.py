@@ -261,17 +261,3 @@ class Openlbrs(Dataset):
             return x,y    
     def __len__(self):
         return self.n_episodes
-
-if __name__ == '__main__':
-
-    # class_index = open(txt_path).read().splitlines()
-    base_class = 80
-    class_index = np.arange(base_class, 100)
-    dataroot = "/data/datasets/librispeech_fscil/"
-    batch_size_base = 400
-    trainset = LBRS(root=dataroot, phase="train",  index=class_index, k=5,
-                      base_sess=True)
-    cls = np.unique(trainset.targets)
-    trainloader = torch.utils.data.DataLoader(dataset=trainset, batch_size=batch_size_base, shuffle=True, num_workers=0,
-                                              pin_memory=True)
-    list(trainloader)    

@@ -17,8 +17,8 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from models.dfsb import descriptor_matrix
-from tools.dfsb_common import atomic_torch_save, build_base_loader, build_model, load_project_args
+from models.lsrb import descriptor_matrix
+from tools.lsrb_common import atomic_torch_save, build_base_loader, build_model, load_project_args
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=str(ROOT / "configs/exp_ls100.yml"))
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--dataset", default="librispeech")
-    parser.add_argument("--dataroot", default="/data/datasets/librispeech_fscil/")
+    parser.add_argument("--dataroot", required=True)
     parser.add_argument("--output", default=str(ROOT / "artifacts/structure_banks/descriptors.pt"))
     parser.add_argument("--metadata", default=str(ROOT / "artifacts/structure_banks/extraction_metadata.json"))
     parser.add_argument("--max-descriptors", type=int, default=200000)

@@ -13,7 +13,6 @@ import tempfile
 from tqdm import tqdm
 from urllib.request import urlopen
 from urllib.parse import urlparse  # noqa: F401
-from .resnet_enhancer import LocalFeatureCluster
 
 def load_state_dict_from_url(url, model_dir=None, map_location=None, progress=True):
     r"""Loads the Torch serialized object at the given URL.
@@ -246,7 +245,6 @@ class ResNet(nn.Module):
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
-        # self.feature_enhance = LocalFeatureCluster(feat_dim=64, k_ratio=0.15)
         self.inplanes = 64
         self.dilation = 1
         if replace_stride_with_dilation is None:
@@ -320,7 +318,6 @@ class ResNet(nn.Module):
         x = self.relu(x)
         x = self.maxpool(x)
         x = self.layer1(x)
-        # x = self.feature_enhance(x)  # 输出仍为(B,256,14,14)
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)

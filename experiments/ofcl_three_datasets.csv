@@ -1,4 +1,0 @@
-method,dataset,provenance,seed,base_acc,inc_aa,final_inc,all_aa,auroc_aa,osr_f1_aa,source
-OFCL-acoustic-transfer,FSC-89,official-component-transfer,3420,0.5756521739130435,0.0094375,0.01075,0.45974216878204577,0.33320000000000005,0.0,artifacts/ofcl_transfer/fsc89/seed3420/metrics.json
-OFCL-acoustic-transfer,LS-100,official-component-transfer,3420,0.852875,0.47045833333333337,0.3885,0.7908792311661506,0.8892,0.7978066297420838,artifacts/ofcl_transfer/ls100/seed3420/metrics.json
-OFCL-acoustic-transfer,NS-100,official-component-transfer,3420,0.9985,0.625875,0.6195,0.9489786807705538,0.9380000000000001,0.8989494301994301,artifacts/ofcl_transfer/ns100/seed3420/metrics.json

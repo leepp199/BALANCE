@@ -18,6 +18,26 @@ from torchlibrosa.stft import Spectrogram, LogmelFilterBank
 from torchlibrosa.augmentation import SpecAugmentation
 
 
+def _metadata_paths(root, args=None):
+    """Resolve NS-100 split metadata relative to the supplied dataset root."""
+    explicit = str(getattr(args, 'ns100_metadata_root', '') or '') if args is not None else ''
+    metadata_root = explicit or os.path.join(os.path.abspath(root), 'nsynth-100-fs-meta')
+    names = {
+        'train': 'nsynth-100-fs_train.csv',
+        'val': 'nsynth-100-fs_val.csv',
+        'test': 'nsynth-100-fs_test.csv',
+        'vocab': 'nsynth-100-fs_vocab.json',
+    }
+    paths = {split: os.path.join(metadata_root, name) for split, name in names.items()}
+    missing = [path for path in paths.values() if not os.path.isfile(path)]
+    if missing:
+        raise FileNotFoundError(
+            'NS-100 metadata files were not found. Set --ns100_metadata_root or place '
+            f'nsynth-100-fs-meta below the dataset root; missing={missing}'
+        )
+    return paths
+
+
 class NDS(Dataset):
 
     def __init__(self, root='./', phase='train', 
@@ -28,10 +48,11 @@ class NDS(Dataset):
         # self.make_extractor()
         self.phase = phase
         # self.train = train  # training set or test set
-        self.all_train_df = pd.read_csv(f"/data/datasets/The_NSynth_Dataset/nsynth-100-fs-meta/nsynth-100-fs_train.csv")
-        self.all_val_df = pd.read_csv(f"/data/datasets/The_NSynth_Dataset/nsynth-100-fs-meta/nsynth-100-fs_val.csv")
-        self.all_test_df = pd.read_csv(f"/data/datasets/The_NSynth_Dataset/nsynth-100-fs-meta/nsynth-100-fs_test.csv")
-        with open(f"/data/datasets/The_NSynth_Dataset/nsynth-100-fs-meta/nsynth-100-fs_vocab.json") as vocab_json_file:
+        metadata = _metadata_paths(root, args)
+        self.all_train_df = pd.read_csv(metadata['train'])
+        self.all_val_df = pd.read_csv(metadata['val'])
+        self.all_test_df = pd.read_csv(metadata['test'])
+        with open(metadata['vocab']) as vocab_json_file:
             self.label_to_ix = json.load(vocab_json_file)
 
         if phase == 'train':
@@ -169,10 +190,11 @@ class Opennds(Dataset):
         self.index = index
         self.root=root
         self.partition = partition
-        self.all_train_df = pd.read_csv(f"/data/datasets/The_NSynth_Dataset/nsynth-100-fs-meta/nsynth-100-fs_train.csv")
-        self.all_val_df = pd.read_csv(f"/data/datasets/The_NSynth_Dataset/nsynth-100-fs-meta/nsynth-100-fs_val.csv")
-        self.all_test_df = pd.read_csv(f"/data/datasets/The_NSynth_Dataset/nsynth-100-fs-meta/nsynth-100-fs_test.csv")
-        with open(f"/data/datasets/The_NSynth_Dataset/nsynth-100-fs-meta/nsynth-100-fs_vocab.json") as vocab_json_file:
+        metadata = _metadata_paths(root, args)
+        self.all_train_df = pd.read_csv(metadata['train'])
+        self.all_val_df = pd.read_csv(metadata['val'])
+        self.all_test_df = pd.read_csv(metadata['test'])
+        with open(metadata['vocab']) as vocab_json_file:
             self.label_to_ix = json.load(vocab_json_file)
         self.datapath, self.labels = self.SelectfromClasses(self.all_train_df, index, per_num=None)
         self.data={}
@@ -274,17 +296,3 @@ class Opennds(Dataset):
         base_ids = np.setxor1d(self.index, np.concatenate([cls_sampled,cls_open_ids]))
         base_ids = np.array(sorted(base_ids))
         return support_xs, support_ys, query_xs, query_ys, suppopen_xs, suppopen_ys, openset_xs, openset_ys, cls_sampled, cls_open_ids,base_ids
-
-if __name__ == '__main__':
-
-    # class_index = open(txt_path).read().splitlines()
-    base_class = 59
-    class_index = np.arange(base_class, 89)
-    dataroot = "/data/datasets/The_NSynth_Dataset"
-    batch_size_base = 400
-    trainset = NDS(root=dataroot, phase="train",  index=class_index, k=5,
-                      base_sess=False)
-    cls = np.unique(trainset.targets)
-    trainloader = torch.utils.data.DataLoader(dataset=trainset, batch_size=batch_size_base, shuffle=True, num_workers=8,
-                                              pin_memory=True)
-    list(trainloader)    

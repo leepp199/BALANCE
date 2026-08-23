@@ -1,50 +1,158 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /data/lqq/baseline_dfsb
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+project_root="$(cd -- "${script_dir}/.." && pwd)"
+cd "$project_root"
+
+python_bin="${FOWAC_PYTHON:-python}"
+require_assets="${FOWAC_REQUIRE_ASSETS:-0}"
+
+fail() {
+  echo "OFFLINE PREFLIGHT FAILED: $*" >&2
+  exit 2
+}
 
 require_file() {
-  if [[ ! -s "$1" ]]; then
-    echo "OFFLINE PREFLIGHT FAILED: missing file: $1" >&2
-    exit 2
+  [[ -s "$1" ]] || fail "missing or empty file: $1"
+}
+
+check_optional_dir() {
+  local variable_name="$1"
+  local label="$2"
+  local value="${!variable_name:-}"
+  if [[ -n "$value" ]]; then
+    [[ -d "$value" ]] || fail "$label directory does not exist: $value"
+    echo "asset ok: $label=$value"
+  elif [[ "$require_assets" == "1" ]]; then
+    fail "$variable_name is required when FOWAC_REQUIRE_ASSETS=1"
+  else
+    echo "asset skipped: $variable_name is not set"
   fi
 }
 
-require_dir() {
-  if [[ ! -d "$1" ]]; then
-    echo "OFFLINE PREFLIGHT FAILED: missing directory: $1" >&2
-    exit 2
+check_optional_file() {
+  local variable_name="$1"
+  local label="$2"
+  local required_when_strict="${3:-1}"
+  local value="${!variable_name:-}"
+  if [[ -n "$value" ]]; then
+    [[ -s "$value" ]] || fail "$label file does not exist or is empty: $value"
+    echo "asset ok: $label=$value"
+  elif [[ "$require_assets" == "1" && "$required_when_strict" == "1" ]]; then
+    fail "$variable_name is required when FOWAC_REQUIRE_ASSETS=1"
+  else
+    echo "asset skipped: $variable_name is not set"
   fi
 }
 
-require_dir /data/datasets/The_NSynth_Dataset
-require_dir /data/datasets/FSD-MIX-CLIPS-for_FSCIL/FSD-MIX-CLIPS_data
-require_file /data/lqq/baseline/save/exp_ns100/epoch_15.pth
-require_file /data/lqq/baseline/save/exp_fsc89/epoch_15.pth
-require_file configs/exp_ns100.yml
-require_file configs/exp_fsc89.yml
-
-# Fail early if the main execution path regresses to implicit URL loading.
-if rg -n 'self\.encoder = resnet18\(True' network.py >/dev/null; then
-  echo 'OFFLINE PREFLIGHT FAILED: MYNET still enables implicit pretrained download' >&2
-  exit 3
-fi
-
-# Hugging Face/Transformers and common experiment trackers must remain offline.
+# Prevent libraries and experiment trackers from initiating network access.
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export WANDB_MODE=offline
 export WANDB_DISABLED=true
+export TORCH_HOME="${TORCH_HOME:-${project_root}/.offline_torch}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-${TMPDIR:-/tmp}/fowac-matplotlib}"
+mkdir -p "$MPLCONFIGDIR"
 
-python -m py_compile network.py train_unopenset.py threshold_free.py
-python - <<'PY'
+core_files=(
+  requirements.txt
+  network.py
+  threshold_free.py
+  train_unopenset.py
+  models/AttnClassifier.py
+  models/FSEval.py
+  models/metatrainer_oo.py
+  models/lsrb.py
+  models/resnet18_encoder.py
+  models/uncertainty.py
+  scripts/run_fowac.sh
+  configs/exp_ls100.yml
+  configs/exp_ns100.yml
+  configs/exp_fsc89.yml
+)
+for path in "${core_files[@]}"; do
+  require_file "$path"
+done
+
+bash -n scripts/run_fowac.sh
+
+# Fail if the primary network constructor is changed back to implicit downloads.
+if command -v rg >/dev/null 2>&1; then
+  if rg -n 'self\.encoder = resnet18\(True' network.py >/dev/null; then
+    fail "network.py enables implicit pretrained-weight downloading"
+  fi
+else
+  if grep -n 'self\.encoder = resnet18(True' network.py >/dev/null; then
+    fail "network.py enables implicit pretrained-weight downloading"
+  fi
+fi
+
+"$python_bin" -m py_compile \
+  network.py \
+  threshold_free.py \
+  train_unopenset.py \
+  models/AttnClassifier.py \
+  models/FSEval.py \
+  models/metatrainer_oo.py \
+  models/lsrb.py \
+  models/resnet18_encoder.py \
+  models/uncertainty.py
+
+"$python_bin" - <<'PY'
+import importlib
+
 import yaml
-for path in ('configs/exp_ns100.yml', 'configs/exp_fsc89.yml'):
-    with open(path) as handle:
-        save_dir = yaml.safe_load(handle)['train'].get('save_dir')
-    if not save_dir:
-        raise SystemExit(f'OFFLINE PREFLIGHT FAILED: no save_dir in {path}')
-    print(f'{path}: checkpoint root={save_dir}')
+
+configs = {
+    "configs/exp_ls100.yml": (80, 100),
+    "configs/exp_ns100.yml": (80, 100),
+    "configs/exp_fsc89.yml": (69, 89),
+}
+for path, (expected_base, expected_all) in configs.items():
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle)
+    if not isinstance(payload, dict) or not isinstance(payload.get("train"), dict):
+        raise SystemExit(f"OFFLINE PREFLIGHT FAILED: invalid train config: {path}")
+    train = payload["train"]
+    if train.get("num_base") != expected_base or train.get("num_all") != expected_all:
+        raise SystemExit(
+            f"OFFLINE PREFLIGHT FAILED: protocol mismatch in {path}: "
+            f"num_base={train.get('num_base')} num_all={train.get('num_all')}"
+        )
+    if train.get("num_session") != 5 or train.get("way") != 5 or train.get("shot") != 5:
+        raise SystemExit(f"OFFLINE PREFLIGHT FAILED: session protocol mismatch in {path}")
+    print(f"config ok: {path}")
+
+modules = (
+    "models.AttnClassifier",
+    "models.FSEval",
+    "models.metatrainer_oo",
+    "models.lsrb",
+    "models.resnet18_encoder",
+    "models.uncertainty",
+    "network",
+    "threshold_free",
+    "train_unopenset",
+    "data.librispeech",
+    "data.nsynth",
+    "data.FMC",
+)
+for name in modules:
+    importlib.import_module(name)
+    print(f"import ok: {name}")
 PY
-echo 'OFFLINE PREFLIGHT PASSED'
-echo 'Required datasets, checkpoints, configs, and Python entry points are local.'
+
+check_optional_dir FOWAC_LS100_DATA "LS-100 data"
+check_optional_dir FOWAC_NS100_DATA "NS-100 data"
+check_optional_dir FOWAC_FSC89_DATA "FSC-89 data"
+check_optional_dir FOWAC_NS100_METADATA "NS-100 metadata"
+check_optional_dir FOWAC_FSC89_METADATA "FSC-89 metadata"
+check_optional_file FOWAC_LS100_CHECKPOINT "LS-100 checkpoint"
+check_optional_file FOWAC_NS100_CHECKPOINT "NS-100 checkpoint"
+check_optional_file FOWAC_FSC89_CHECKPOINT "FSC-89 checkpoint"
+check_optional_file FOWAC_LSRB_CHECKPOINT "LSRB checkpoint"
+check_optional_file FOWAC_FSC89_GEOMETRY "FSC-89 geometry"
+
+echo "OFFLINE PREFLIGHT PASSED"
+echo "Source, protocol configurations, and core imports are available offline."

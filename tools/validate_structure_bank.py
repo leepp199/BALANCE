@@ -13,8 +13,8 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from models.dfsb import DeepFeatureStructureBank
-from tools.dfsb_common import build_base_loader, build_model, load_project_args
+from models.lsrb import LatentStructureReferenceBank
+from tools.lsrb_common import build_base_loader, build_model, load_project_args
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--bank", default=str(ROOT / "artifacts/structure_banks/structure_bank.pt"))
     parser.add_argument("--dataset", default="librispeech")
-    parser.add_argument("--dataroot", default="/data/datasets/librispeech_fscil/")
+    parser.add_argument("--dataroot", required=True)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -36,7 +36,7 @@ def main() -> None:
     project_args = load_project_args(cli.config, cli.dataset, cli.dataroot)
     _, loader = build_base_loader(project_args, cli.batch_size, cli.workers)
     model, _, _ = build_model(project_args, cli.checkpoint, device)
-    bank = DeepFeatureStructureBank.load(cli.bank).to(device)
+    bank = LatentStructureReferenceBank.load(cli.bank).to(device)
 
     batch = next(iter(loader))
     waveforms = batch[0].to(device)
@@ -64,7 +64,7 @@ def main() -> None:
         "same_bank_for_all_samples": True,
     }
     if not report["all_finite"] or not torch.allclose(response_sums, torch.ones_like(response_sums), atol=1e-5):
-        raise RuntimeError(f"DFSB validation failed: {report}")
+        raise RuntimeError(f"LSRB validation failed: {report}")
     print(json.dumps(report, indent=2))
 
 

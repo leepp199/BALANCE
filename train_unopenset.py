@@ -6,9 +6,8 @@ import argparse
 import random
 import yaml
 import torch
-from sklearn.preprocessing import RobustScaler
 import torch.nn as nn  
-from utils.util import cluster_acc,calc
+from utils.util import calc
 from utils.utils import *
 from network import MYNET,get_optimizer,replace_base_fc
 from data.dataloader import *
@@ -18,12 +17,10 @@ from sklearn.cluster import KMeans
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import f1_score, adjusted_rand_score, normalized_mutual_info_score
 from tqdm import tqdm
-from openmax import *
 from models.metatrainer_oo import meta_train
+from models.lsrb import LatentStructureReferenceBank
 # from models.metaowtrainer import meta_train
 from threshold_free import run_test_fsl, reset_session_stats, _adaptive_margin_threshold
-from models.AttnClassifier import Classifier
-from utils.streamCluster import FStream
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.manifold import TSNE
@@ -34,10 +31,7 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import pairwise_distances  # 
 from sklearn.cluster import DBSCAN  # DBSCAN
 from matplotlib import rcParams
-from sklearn.metrics.pairwise import cosine_similarity 
 from scipy.optimize import linear_sum_assignment
-from enhance_module import LocalFeatureCluster
-from models.robust_proto_adapter import RobustPrototypeAdapter
 import math
 import joblib
 
@@ -80,7 +74,23 @@ _PROTO_STATS_MEMORY = None
 _NOVEL_SUPPORT_BANK = {}
 _LABELED_SUPPORT_PROTOS = {}
 _PRECOMPUTED_DISCOVERY_ASSIGNMENTS = None
-_ROBUST_PROTO_ADAPTER = None
+_STRUCTURE_DISCOVERY_MODEL = None
+_STRUCTURE_DISCOVERY_BANK = None
+_STRUCTURE_DISCOVERY_PATH = None
+
+_RETIRED_CHECKPOINT_PREFIXES = ('feature_enhance.',)
+
+
+def _drop_retired_checkpoint_keys(state, source='checkpoint'):
+    """Remove state entries belonging to retired, inference-inactive modules."""
+    cleaned = {
+        key: value for key, value in state.items()
+        if not key.startswith(_RETIRED_CHECKPOINT_PREFIXES)
+    }
+    removed = sorted(set(state) - set(cleaned))
+    if removed:
+        print(f'[CHECKPOINT] ignored {len(removed)} retired feature-enhancer keys from {source}')
+    return cleaned
 
 
 def ridge_refine_novel_prototypes(args, model, novel_ids):
@@ -194,55 +204,6 @@ class UncertaintyCenterLoss(nn.Module):
             loss = dist.clamp(min=1e-12, max=1e+12).sum() / batch_size
 
         return loss
-def set_mcd_mode(model):
-    """
-    开启 MC Dropout 模式：
-    保持 BatchNorm 为 eval 模式（稳定统计量），但强制开启 Dropout（引入随机性）。
-    """
-    model.eval() # 全局设为 eval
-    
-    # 遍历所有子模块，单独激活 Dropout
-    for m in model.modules():
-        if isinstance(m, torch.nn.Dropout):
-            m.train()
-def calculate_uncertainty_unlabeled(model, enhancer, sample, n_aug=5, n_forward=5):
-    """
-    计算无标签样本的不确定度 (基于特征掩码 + MC Dropout)
-    """
-    # 1. 开启 MC Dropout 模式 (Dropout 生效)
-    set_mcd_mode(model)
-    
-    features_list = []
-    device = next(model.parameters()).device
-    
-    if sample.dim() == 1:
-        sample = sample.unsqueeze(0)
-    sample = sample.to(device)
-
-    with torch.no_grad():
-        # 外层循环：不同的 Mask (通过 augment=True 触发)
-        for _ in range(n_aug):
-            # 内层循环：不同的 Dropout (通过 MC Dropout 触发)
-            for _ in range(n_forward):
-                
-                # 【关键】调用时开启 augment=True
-                # 这会触发 Log Mel 谱图上的随机时间/频率遮挡
-                feat = model.hgnn_encode(sample, augment=True) 
-                
-                # 通过增强模块
-                feat, _ = enhancer(feat) 
-                
-                if feat.dim() > 2:
-                    feat = feat.mean(dim=[2,3]) if feat.dim()==4 else feat.mean(dim=1)
-                
-                features_list.append(feat.squeeze())
-    
-    P = torch.stack(features_list)
-    
-    # 计算核范数
-    uncertainty = torch.norm(P, p='nuc').item()
-    
-    return uncertainty
 
 def set_seed(seed=42):
     import random
@@ -302,17 +263,18 @@ def set_up_datasets(args):
 
 def args_parser():
     parser = argparse.ArgumentParser(description='cluster', add_help=False)
-    parser.add_argument('-config', type=str, default="/data/lqq/baseline/configs/default.yml") 
-    parser.add_argument('-dist_path', type=str, default="/data/lqq/baseline/save/dist.mat") 
+    parser.add_argument('-config', type=str, default="configs/exp_ls100.yml")
+    parser.add_argument('-dist_path', type=str, default="artifacts/dist.mat")
     parser.add_argument('-dataset', type=str, default='librispeech',
                         choices=['FMC', 'nsynth-100', 'nsynth-200', 'nsynth-300', 'nsynth-400', 'librispeech',
                         'f2n', 'f2l', 'n2f', 'n2l', 'l2f', 'l2n'])
-    # parser.add_argument('--dataroot', type=str,default="/data/datasets/The_NSynth_Dataset/")
-    # parser.add_argument('--dataroot', type=str,default="/data/datasets/FSD-MIX-CLIPS-for_FSCIL/FSD-MIX-CLIPS_data")
-    
-    parser.add_argument('--dataroot', type=str,default="/data/datasets/librispeech_fscil/")
+    parser.add_argument('--dataroot', type=str, required=True)
+    parser.add_argument('--ns100_metadata_root', type=str, default='',
+                        help='Directory containing the NS-100 CSV splits and vocabulary.')
+    parser.add_argument('--fsc89_metadata_root', type=str, default='',
+                        help='Directory containing the FSC-89 train/val/test CSV splits.')
     parser.add_argument('--threshold', type=float, default=0.4)
-    parser.add_argument('--save_result',type = str,default='/data/lqq/baseline/save_result/')
+    parser.add_argument('--save_result', type=str, default='outputs')
     parser.add_argument('--save_dir', type=str, default=None,
                         help='Optional isolated checkpoint directory override for retraining.')
     parser.add_argument('--num_unlabeled_classes', default=5, type=int)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
@@ -330,7 +292,7 @@ def args_parser():
     parser.add_argument('--load_base', type=_str2bool, default=True, help='Skip base training and load pretrained base model')
     parser.add_argument('--learning_rate', type=float, default=0.001, help='learning rate')
     parser.add_argument('--cosine', type=bool,default=True, help='using cosine annealing')
-    parser.add_argument('--pretrained_model_path', type=str, default="/data/lqq/baseline/save/base_train_for_meta.pth")
+    parser.add_argument('--pretrained_model_path', type=str, default='')
     parser.add_argument('--train_weight_base', type=int, default=1, help='enable training base class weights')
     parser.add_argument('--base_seman_calib',type=int, default=1, help='base semantics calibration')
     parser.add_argument('--neg_gen_type', type=str, default='att', choices=['semang', 'attg', 'att', 'mlp'])
@@ -345,9 +307,8 @@ def args_parser():
     parser.add_argument('--outer_steps', default=5, type=int)
     parser.add_argument('--debug', default=True, type=bool)
     parser.add_argument('--use_cffm_eval', type=_str2bool, default=False,
-                        help='Use the checkpointed model CFFM during OSR evaluation. '
-                             'Disabled by default because legacy checkpoints were not '
-                             'trained/evaluated consistently with this path.')
+                        help='Deprecated compatibility flag. True is rejected because the '
+                             'public method uses the current encoder only.')
     # 在args_parser()中添加以下参数
     parser.add_argument('--pit_weight', type=float, default=0.5, help='weight for pseudo-incremental loss')
     parser.add_argument('--pit_num_new_classes', type=int, default=5, help='number of pseudo new classes')
@@ -386,7 +347,7 @@ def args_parser():
                         help='Robust pseudo-cluster prototype: iteratively remove this many farthest '
                              'model.encode samples before taking the mean.')
     parser.add_argument('--robust_proto_adapter_path', type=str, default='',
-                        help='Local base-only robust prototype adapter checkpoint; empty disables it.')
+                        help='Deprecated compatibility flag. Non-empty values are rejected.')
     parser.add_argument('--prototype_linear_adapter_path', type=str, default='',
                         help='Offline base-only residual map from model.encode means to trained classifier weights.')
     parser.add_argument('--prototype_linear_adapter_strength', type=float, default=1.0,
@@ -416,17 +377,16 @@ def args_parser():
     parser.add_argument('--use_joint_cluster_assignments', type=_str2bool, default=False,
                         help='Reuse the five clusters selected by joint 10-way CANA instead of reclustering them.')
     parser.add_argument('--session_restricted_alignment', type=_str2bool, default=True,
-                        help='For permutation-invariant evaluation, align discovered clusters only to the '
-                             'five current-session class IDs; never overwrite prior-session prototypes.')
+                        help='Compatibility flag; the public method always performs label-free alignment '
+                             'against the five current-session support prototypes.')
     parser.add_argument('--structure_feature_layers', type=str, default='layer4',
                         help='Comma-separated ResNet stages used by the structure discovery branch. '
                              'Supported values: layer2,layer3,layer4. Each pooled stage is normalized '
                              'before concatenation, enabling controlled single- and multi-layer ablations.')
-    parser.add_argument('--discovery_encoder', type=str, default='hgnn_lfc',
+    parser.add_argument('--discovery_encoder', type=str, default='direct',
                         choices=['hgnn_lfc', 'direct'],
-                        help='Feature space used to form novel prototypes. direct uses model.encode '
-                             'and is classifier-consistent for base-only checkpoints; hgnn_lfc '
-                             'preserves the legacy meta-trained discovery path.')
+                        help='Feature space used for discovery. The public method requires direct; '
+                             'hgnn_lfc is retained only so old commands fail with a clear message.')
     parser.add_argument('--encode_tta_views', type=int, default=1,
                         help='Deterministic waveform-shift views averaged through the same model.encode; 1 disables TTA.')
     parser.add_argument('--feature_centering', type=_str2bool, default=False,
@@ -582,7 +542,8 @@ def args_parser():
                         help='scale factor for OSR thresholds (thr_open/thr_cls). '
                              '<1.0 => more samples kept as known; >1.0 => more rejected to unknown')
     parser.add_argument('--support_proto_blend', type=float, default=1.0,
-                        help='weight on few-shot model.encode prototype; remaining weight uses current-encoder discovered geometry')
+                        help='Compatibility flag. The public method requires 1.0 so prototypes use '
+                             'only the five labeled support embeddings.')
     parser.add_argument('--use_uop', type=_str2bool, default=False,
                         help='Enable Unified Open-set Prototype: chunked OpenSetGenerater + mean → single global open prototype '
                              '(fixes train/test scale mismatch on nway).')
@@ -606,12 +567,11 @@ def args_parser():
                         help='Noise std on supp_protos before open_generator in training '
                              '(matches osr_noise_std, helps generator generalize to novel protos).')
     parser.add_argument('--oracle_cluster', type=_str2bool, default=False,
-                        help='If True, skip KMeans and use ground-truth labels for novel-class prototype assignment '
-                        '(upper-bound experiment).')
+                        help='Deprecated upper-bound flag. True is rejected by the public entry point.')
     parser.add_argument('--structure_discovery_checkpoint', type=str, default='',
-                        help='Frozen DFSB checkpoint used only to augment the clustering space.')
+                        help='Frozen LSRB checkpoint used to augment the discovery space.')
     parser.add_argument('--structure_discovery_weight', type=float, default=0.0,
-                        help='Weight of normalized DFSB features concatenated for novel clustering.')
+                        help='Weight of normalized LSRB responses used for novel discovery.')
     parser.add_argument('--cluster_all_candidates', type=_str2bool, default=False,
                         help='Retain both rejected and low-confidence accepted stream samples in the discovery buffer.')
     parser.add_argument('--discovery_ranked_topk', type=int, default=0,
@@ -699,6 +659,40 @@ def args_parser():
     #                   help='Enable debug mode with visualizations')
     return parser
 
+
+def _validate_public_method_args(args):
+    """Reject legacy prototype paths that are not part of the public method."""
+    errors = []
+    if str(getattr(args, 'discovery_encoder', 'direct')) != 'direct':
+        errors.append('--discovery_encoder must be direct; hgnn_lfc is a retired ablation')
+    if int(getattr(args, 'n_shots', 5)) != 5:
+        errors.append('the public incremental protocol requires exactly 5 support shots per class')
+    if bool(getattr(args, 'use_cffm_eval', False)):
+        errors.append('--use_cffm_eval=True is retired; OSR uses the current encoder')
+    if str(getattr(args, 'robust_proto_adapter_path', '') or ''):
+        errors.append('--robust_proto_adapter_path is retired')
+    if str(getattr(args, 'prototype_linear_adapter_path', '') or ''):
+        errors.append('--prototype_linear_adapter_path is not part of the 5-shot support path')
+    if int(getattr(args, 'prototype_trim_farthest', 0)) != 0:
+        errors.append('--prototype_trim_farthest must be 0 to retain all five supports')
+    if int(getattr(args, 'encode_tta_views', 1)) != 1:
+        errors.append('--encode_tta_views must be 1 for the single current-encoder path')
+    if abs(float(getattr(args, 'support_proto_blend', 1.0)) - 1.0) > 1e-12:
+        errors.append('--support_proto_blend must be 1.0; stream features cannot enter prototypes')
+    if bool(getattr(args, 'oracle_cluster', False)):
+        errors.append('--oracle_cluster=True reads evaluation labels and is not supported')
+    if bool(getattr(args, 'oracle_eval_group_gate', False)):
+        errors.append('--oracle_eval_group_gate=True reads evaluation labels and is not supported')
+    if not bool(getattr(args, 'session_restricted_alignment', True)):
+        errors.append('--session_restricted_alignment=False is a retired label-alignment audit')
+    if bool(getattr(args, 'joint_proto_refine', False)):
+        errors.append('--joint_proto_refine=True is retired because it consumed stream labels')
+    if bool(getattr(args, 'old_proto_adapt', False)):
+        errors.append('--old_proto_adapt=True is retired because it consumed stream labels')
+    if errors:
+        raise ValueError('Unsupported legacy configuration:\n  - ' + '\n  - '.join(errors))
+
+
 def update_fc_avg(args,model,dataloader,x,label,class_list):
     new_fc=[]
     for batch in dataloader:
@@ -731,59 +725,91 @@ import torch
 import torch.nn.functional as F
 
 
-def encode_with_deterministic_tta(model, waveform, views=1):
-    """Average deterministic time-shift views using only the current model.encode."""
-    views = max(int(views), 1)
-    embeddings = [model.encode(waveform)]
-    if views > 1:
-        shift = max(int(waveform.shape[-1] // 100), 1)
-        offsets = [shift, -shift, 2 * shift, -2 * shift]
-        for offset in offsets[:views - 1]:
-            embeddings.append(model.encode(torch.roll(waveform, shifts=offset, dims=-1)))
-    return torch.stack(embeddings, dim=0).mean(0)
+def _encode_current_session_supports(args, model, session_batches, session):
+    """Encode exactly five labeled supports per current class with ``model.encode``."""
+    global _LABELED_SUPPORT_PROTOS
+    device = next(model.parameters()).device
+    current_start = int(args.num_base) + (int(session) - 1) * int(args.way)
+    if int(args.num_labeled_classes) != current_start:
+        raise RuntimeError(
+            f'session/support class boundary mismatch: registered={args.num_labeled_classes}, '
+            f'expected={current_start}')
+    support_ids = list(range(current_start, current_start + int(args.way)))
+    waveforms_by_class = {class_id: [] for class_id in support_ids}
+
+    for batch in session_batches:
+        if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+            raise TypeError('incremental support batches must contain (waveform, label)')
+        waveforms, labels = batch[0], batch[1]
+        labels = torch.as_tensor(labels).reshape(-1)
+        if int(waveforms.shape[0]) != int(labels.numel()):
+            raise RuntimeError('support waveform/label batch sizes do not match')
+        for waveform, label in zip(waveforms, labels):
+            class_id = int(label.item())
+            if class_id not in waveforms_by_class:
+                continue
+            while waveform.dim() > 1 and waveform.shape[0] == 1:
+                waveform = waveform.squeeze(0)
+            if waveform.dim() != 1:
+                raise RuntimeError(
+                    f'expected one-dimensional waveform support, got {tuple(waveform.shape)}')
+            waveforms_by_class[class_id].append(waveform)
+
+    original_mode = model.mode
+    try:
+        model.mode = 'incre'
+        with torch.no_grad():
+            for class_id in support_ids:
+                class_waveforms = waveforms_by_class[class_id]
+                if len(class_waveforms) != 5:
+                    raise RuntimeError(
+                        f'class {class_id} requires exactly 5 labeled supports, '
+                        f'but the episode contains {len(class_waveforms)}')
+                support_batch = torch.stack(class_waveforms).to(device, non_blocking=True)
+                embeddings = model.encode(support_batch)
+                if embeddings.dim() != 2 or embeddings.shape[0] != 5:
+                    raise RuntimeError(
+                        f'model.encode returned invalid support shape {tuple(embeddings.shape)}')
+                _LABELED_SUPPORT_PROTOS[class_id] = embeddings.detach().clone()
+    finally:
+        model.mode = original_mode
+
+    print(f'  [SUPPORT-ENCODE] session={session} classes={support_ids} '
+          'shots=5 source=current_encoder')
 
 
-def debug_cluster(args, model, data, labels, session=None):
+def discover_and_register(args, model, data, labels, session=None):
     global _PROTO_STATS_MEMORY, _PRECOMPUTED_DISCOVERY_ASSIGNMENTS, _LABELED_SUPPORT_PROTOS
+    """Discover candidate groups and report their alignment to registered supports.
+
+    Classifier rows are installed from the labeled five-shot episode before discovery.
+    Stream labels are accepted only for ACC/NMI/ARI reporting and never affect the update.
     """
-    改进版：聚类 -> 伪标签 -> 原地压缩 (Prototype Compaction)
-    Task 1.3 新增：加入 base-proto 余弦距离下限约束，防止新类原型被压向 base。
-    Task 1.4 新增：在 KMeans 前过滤掉与 base 原型 cos 相似度过高的 "疑似 base" 样本，
-                    避免漏过的 base 污染新类聚类中心。
-    oracle_cluster: 跳过 KMeans，直接用真实标签（偷看标签测上限）。
-    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    support_ids = _install_current_session_prototypes(args, model, device)
     if data is None or len(data) == 0:
         return 0.0
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # 1. 提取特征 — 使用 hgnn_encode + 缓存的 LocalFeatureCluster (v10_y 已验证路径)
+    # 1. Candidate discovery uses the same current encoder as the 5-shot supports.
     with torch.no_grad():
         model.mode = 'incre'
         features_list = []
         structure_features_list = []
-        discovery_encoder = str(getattr(args, 'discovery_encoder', 'hgnn_lfc'))
-        lfc = _get_lfc(device, k_ratio=0.4) if discovery_encoder == 'hgnn_lfc' else None
-        structure_model = _get_structure_discovery_model(args, device)
+        structure_model, structure_bank = _get_structure_discovery_model(args, device)
         for x in data:
-            if discovery_encoder == 'direct':
-                f = encode_with_deterministic_tta(model, x.to(device),
-                                                  int(getattr(args, 'encode_tta_views', 1)))
-                features_list.append(f.squeeze())
-            else:
-                f = model.hgnn_encode(x)           # [1, C, H, W]
-                f, _ = lfc(f)                      # LFC (weights cached across sessions)
-                features_list.append(f.squeeze())  # [512]
+            features_list.append(model.encode(x.to(device)).squeeze())
             if structure_model is not None:
                 requested_layers = [s.strip() for s in
                                     str(getattr(args, 'structure_feature_layers', 'layer4')).split(',')
                                     if s.strip()]
-                pooled_stages = []
-                for stage in requested_layers:
-                    sf = structure_model.forward_to_stage(x.to(device), stage=stage, augment=False)
-                    sf = F.adaptive_avg_pool2d(sf, 1).flatten(1)
-                    pooled_stages.append(F.normalize(sf, dim=-1))
-                structure_features_list.append(torch.cat(pooled_stages, dim=-1).squeeze())
+                if len(requested_layers) != 1:
+                    raise ValueError(
+                        'One LSRB checkpoint defines one descriptor space; '
+                        '--structure_feature_layers must name exactly one stage')
+                stage_map = structure_model.forward_to_stage(
+                    x.to(device), stage=requested_layers[0], augment=False)
+                outputs = structure_bank.compute(stage_map)
+                structure_features_list.append(outputs.structural_response.squeeze(0))
         features = torch.stack(features_list).to(device)  # [N, 512]
         cluster_features = features
         if structure_features_list:
@@ -796,54 +822,11 @@ def debug_cluster(args, model, data, labels, session=None):
         elif getattr(args, 'normalize_cluster_features', False):
             cluster_features = F.normalize(features, dim=-1)
 
-    # ===== ORACLE PATH: skip KMeans, use ground truth labels directly =====
-    if getattr(args, 'oracle_cluster', False):
-        global _NOVEL_SUPPORT_BANK
-        labels_np = np.array(labels)
-        _nl = args.num_labeled_classes
-        novel_labels = sorted(set(l for l in labels_np if l >= _nl))
-        expected_novel = args.num_unlabeled_classes
-
-        base_end = _nl
-        base_protos = model.fc.weight[:base_end, :].detach().to(device)
-
-        print(f'  [ORACLE] session={session} total_unknown={len(labels)} '
-              f'novel_found={len(novel_labels)}/{expected_novel} '
-              f'novel_ids={novel_labels}')
-
-        for cls_id in novel_labels:
-            indices = [i for i, l in enumerate(labels_np) if l == cls_id]
-            cls_features = features[indices]
-            # Retain current model.encode supports for optional routing/bank
-            # scoring. The expanded class prototype itself remains their mean.
-            _NOVEL_SUPPORT_BANK[int(cls_id)] = cls_features.detach().clone()
-            init_proto = cls_features.mean(dim=0)
-            linear_adapter_path = str(getattr(args, 'prototype_linear_adapter_path', ''))
-            if linear_adapter_path:
-                if not os.path.isfile(linear_adapter_path):
-                    raise FileNotFoundError(f'prototype linear adapter is not local: {linear_adapter_path}')
-                adapter_state = torch.load(linear_adapter_path, map_location=device, weights_only=True)
-                mapped_proto = init_proto @ adapter_state['weight'].to(init_proto)
-                strength = float(getattr(args, 'prototype_linear_adapter_strength', 1.0))
-                init_proto = init_proto + strength * (mapped_proto - init_proto)
-
-            final_proto = optimize_prototype_compactness(
-                init_proto, cls_features,
-                lr=getattr(args, 'compact_lr', 0.05),
-                steps=getattr(args, 'compact_steps', 30),
-                base_protos=base_protos,
-                base_margin=getattr(args, 'compact_base_margin', 0.2),
-            )
-            model.fc.weight.data[cls_id] = final_proto
-
-        return len(novel_labels) / max(expected_novel, 1)
-    # ===== END ORACLE =====
-
     # 收集当前 base (+之前更新的增量类) 原型用于约束和过滤
     base_end = args.num_labeled_classes  # 当前已登记的类数
     base_protos = model.fc.weight[:base_end, :].detach().to(device)
 
-    # --- Task 1.4: 过滤疑似 base 的样本（自适应阈值） ---
+    # Filter candidates that are overly similar to registered-class prototypes.
     keep_mask = torch.ones(features.shape[0], dtype=torch.bool, device=device)
     kmeans_filter_thr = float(getattr(args, 'kmeans_filter_thr', 0.0))
     kmeans_filter_quantile = float(getattr(args, 'kmeans_filter_quantile', 0.0))
@@ -928,7 +911,7 @@ def debug_cluster(args, model, data, labels, session=None):
         print(f'  [CLU-DIAG] balanced capacities={capacities.tolist()}')
     pseudo_labels = torch.from_numpy(kmeans.labels_).long().to(device)
 
-    # ===== 聚类诊断: KMeans 匈牙利匹配前的原始纯度 + 每簇真实标签分布 =====
+    # Evaluation-only cluster diagnostics.
     _nl_clu = args.num_labeled_classes
     _all_in_unknow = len(labels)
     _true_unk_in_input = sum(1 for l in labels if l >= _nl_clu)
@@ -937,7 +920,6 @@ def debug_cluster(args, model, data, labels, session=None):
           f'true_unknown={_true_unk_in_input} true_known_leaked={_true_known_in_input}')
     if kept_features.shape[0] < len(labels):
         print(f'  [CLU-DIAG] kmeans_filter_thr removed {len(labels) - kept_features.shape[0]} samples')
-    # 每簇真实标签分布（匈牙利匹配前）
     _cluster_label_counts = {}
     for ci in range(n_clusters):
         _mask = kmeans.labels_ == ci
@@ -948,206 +930,32 @@ def debug_cluster(args, model, data, labels, session=None):
         _total_c = int(_mask.sum())
         _cluster_label_counts[ci] = _total_c
         print(f'  [CLU-DIAG] cluster_{ci}: size={_total_c} top_labels=[{_top3}]')
-    # ===== 聚类诊断结束 =====
 
-    # A detector can reject only leaked old-class samples (observed on FSC-89).
-    # The evaluation-only Hungarian helper assumes at least one true novel label;
-    # treat this as zero discovery instead of crashing the whole repeated run.
-    if not np.any(kept_labels_np >= args.num_labeled_classes):
-        print('  [CLU-DIAG] no true novel candidate survived OSR; discovery_acc=0, skip prototype update')
-        return 0.0
+    # Map discovered clusters using only the current session's labeled 5-shot
+    # supports. Evaluation-stream labels below are read exclusively for metrics.
+    support = F.normalize(torch.stack([
+        _LABELED_SUPPORT_PROTOS[class_id].to(device).mean(dim=0)
+        for class_id in support_ids
+    ]), dim=1)
+    centers = F.normalize(torch.stack([
+        kept_features[pseudo_labels == cluster_id].mean(dim=0)
+        for cluster_id in range(n_clusters)
+    ]), dim=1)
+    similarity = centers @ support.t()
+    rows, cols = linear_sum_assignment((-similarity).detach().cpu().numpy())
+    map_dict = {int(row): int(support_ids[col]) for row, col in zip(rows, cols)}
+    print(f'  [SUPPORT-ALIGN] support_ids={support_ids} '
+          f'mapped={map_dict} (evaluation labels excluded)')
 
-    # In the actual few-shot setting, map discovered clusters to class IDs using
-    # the labeled support episode encoded by the current model.  Never use the
-    # evaluation-stream labels for this mapping: ``labels`` above are retained
-    # only for diagnostics/metric reporting.
-    support_map = {}
-    if _LABELED_SUPPORT_PROTOS and str(getattr(args, 'discovery_encoder', 'hgnn_lfc')) == 'direct':
-        support_ids = sorted(int(k) for k in _LABELED_SUPPORT_PROTOS
-                             if int(k) >= int(args.num_labeled_classes))
-        if support_ids:
-            support = F.normalize(torch.stack([
-                _LABELED_SUPPORT_PROTOS[k].to(device).mean(dim=0)
-                if _LABELED_SUPPORT_PROTOS[k].to(device).dim() > 1
-                else _LABELED_SUPPORT_PROTOS[k].to(device)
-                for k in support_ids]), dim=1)
-            centers = F.normalize(torch.stack([
-                features[kmeans.labels_ == ci].mean(dim=0) for ci in range(n_clusters)
-            ]), dim=1)
-            similarity = centers @ support.t()
-            rows, cols = linear_sum_assignment((-similarity).detach().cpu().numpy())
-            support_map = {int(row): int(support_ids[col]) for row, col in zip(rows, cols)}
-            print(f'  [SUPPORT-ALIGN] support_ids={support_ids} '
-                  f'mapped={support_map} (evaluation labels excluded)')
-    if support_map:
-        map_dict = support_map
-        # This is an evaluation metric only: labels are not used to construct
-        # support_map, but may be used here to report discovery accuracy.
-        mapped_labels = np.asarray([map_dict.get(int(c), -1) for c in kmeans.labels_])
-        eval_labels = np.asarray(kept_labels_np)
-        matched = int(np.sum(mapped_labels == eval_labels))
-        acc = matched / max(len(eval_labels), 1)
-    elif bool(getattr(args, 'session_restricted_alignment', True)) and session is not None:
-        current_start = int(args.num_labeled_classes)
-        current_ids = np.arange(current_start, current_start + n_clusters)
-        contingency = np.zeros((n_clusters, n_clusters), dtype=np.int64)
-        for cluster_id, class_id in zip(kmeans.labels_, kept_labels_np):
-            if int(class_id) in current_ids:
-                contingency[int(cluster_id), int(class_id) - current_start] += 1
-        rows, cols = linear_sum_assignment(-contingency)
-        map_dict = {int(row): int(current_ids[col]) for row, col in zip(rows, cols)}
-        matched = int(contingency[rows, cols].sum())
-        acc = matched / max(len(kept_labels_np), 1)
-        print(f'  [ALIGN] current_ids={current_ids.tolist()} matched={matched}/{len(kept_labels_np)}')
-    else:
-        acc, map_dict = cluster_acc(args, kept_labels_np, kmeans.labels_)
+    mapped_labels = np.asarray([map_dict.get(int(cluster_id), -1)
+                                for cluster_id in kmeans.labels_])
+    eval_labels = np.asarray(kept_labels_np)
+    matched = int(np.sum(mapped_labels == eval_labels))
+    acc = matched / max(len(eval_labels), 1)
     nmi = normalized_mutual_info_score(kept_labels_np, kmeans.labels_)
     ari = adjusted_rand_score(kept_labels_np, kmeans.labels_)
     print(f'  [CLU-METRIC] session={session} ACC={acc:.4f} NMI={nmi:.4f} ARI={ari:.4f}')
 
-    # 3. 【核心】利用伪标签进行原型炼化
-    # Z-b: track session-new protos so later clusters repel from already-updated novel protos in same session
-    session_new_protos = []
-    session_new_ids = []
-    novel_margin_z = float(getattr(args, 'compact_novel_margin', 0.0))
-    novel_weight_z = float(getattr(args, 'compact_novel_weight', 1.0))
-    for cluster_id in range(n_clusters):
-        if cluster_id in map_dict:
-            target_class_id = map_dict[cluster_id]
-            if target_class_id >= args.num_labeled_classes:
-
-                # 选出该类的样本
-                idxs = (pseudo_labels == cluster_id)
-                if idxs.sum() == 0: continue
-                cluster_feats = kept_features[idxs]
-
-                # Once the cluster has been identified by the labeled few-shot
-                # episode, the classifier prototype must come from those current
-                # model.encode supports—not from unlabeled test-stream points.
-                # The discovered cluster remains useful for diagnostics only.
-                support_proto = _LABELED_SUPPORT_PROTOS.get(int(target_class_id))
-                if support_proto is not None and str(getattr(args, 'discovery_encoder', 'hgnn_lfc')) == 'direct':
-                    support_proto = support_proto.to(device)
-                    support_bank = support_proto.unsqueeze(0) if support_proto.dim() == 1 else support_proto
-                    # Keep the few-shot model.encode prototype as the anchor, while
-                    # allowing a configurable small contribution from the discovered
-                    # current-encoder geometry for robustness under acoustic shift.
-                    blend = float(getattr(args, 'support_proto_blend', 1.0))
-                    if blend < 1.0 and cluster_feats.numel() > 0:
-                        discovered = F.normalize(cluster_feats.mean(dim=0, keepdim=True), dim=1)
-                        anchor = F.normalize(support_bank.mean(dim=0, keepdim=True), dim=1)
-                        support_bank = F.normalize(blend * anchor + (1.0 - blend) * discovered, dim=1)
-                    _NOVEL_SUPPORT_BANK[int(target_class_id)] = support_bank.detach().clone()
-                    cluster_feats = support_bank
-                    print(f'  [PROTO-SUPPORT] class={target_class_id} '
-                          f'shots={support_bank.shape[0]} source=model.encode')
-
-                # Do not overwrite the labeled model.encode support bank above.
-                # The discovered cluster is retained only for diagnostics and
-                # clustering statistics; replacing the bank here would silently
-                # turn the real non-oracle path back into an unlabeled-stream
-                # prototype and invalidate the support-prototype protocol.
-                if _LABELED_SUPPORT_PROTOS.get(int(target_class_id)) is None:
-                    _NOVEL_SUPPORT_BANK[int(target_class_id)] = cluster_feats.detach().clone()
-
-                trim_count = min(int(getattr(args, 'prototype_trim_farthest', 0)),
-                                 max(int(cluster_feats.shape[0]) - 2, 0))
-                for _ in range(trim_count):
-                    provisional = F.normalize(cluster_feats.mean(0, keepdim=True), dim=1)
-                    similarity = F.normalize(cluster_feats, dim=1) @ provisional.t()
-                    remove_idx = int(similarity.squeeze(1).argmin().item())
-                    keep_idx = torch.ones(cluster_feats.shape[0], dtype=torch.bool, device=device)
-                    keep_idx[remove_idx] = False
-                    cluster_feats = cluster_feats[keep_idx]
-                if trim_count:
-                    print(f'  [PROTO-TRIM] cluster={cluster_id} removed={trim_count} '
-                          f'retained={cluster_feats.shape[0]}')
-
-                # 初始化原型：默认均值；可选 base-only 伪簇去噪网络。
-                adapter_path = str(getattr(args, 'robust_proto_adapter_path', ''))
-                if adapter_path:
-                    global _ROBUST_PROTO_ADAPTER
-                    if _ROBUST_PROTO_ADAPTER is None:
-                        if not os.path.isfile(adapter_path):
-                            raise FileNotFoundError(f'robust prototype adapter is not local: {adapter_path}')
-                        adapter_state = torch.load(adapter_path, map_location=device, weights_only=True)
-                        _ROBUST_PROTO_ADAPTER = RobustPrototypeAdapter(
-                            dim=int(adapter_state.get('dim', cluster_feats.shape[1]))).to(device)
-                        _ROBUST_PROTO_ADAPTER.load_state_dict(adapter_state['state_dict'], strict=True)
-                        _ROBUST_PROTO_ADAPTER.eval()
-                    with torch.no_grad():
-                        init_proto = _ROBUST_PROTO_ADAPTER(cluster_feats)
-                else:
-                    init_proto = cluster_feats.mean(dim=0)
-
-                linear_adapter_path = str(getattr(args, 'prototype_linear_adapter_path', ''))
-                if linear_adapter_path:
-                    if not os.path.isfile(linear_adapter_path):
-                        raise FileNotFoundError(f'prototype linear adapter is not local: {linear_adapter_path}')
-                    adapter_state = torch.load(linear_adapter_path, map_location=device, weights_only=True)
-                    mapped_proto = init_proto @ adapter_state['weight'].to(init_proto)
-                    strength = float(getattr(args, 'prototype_linear_adapter_strength', 1.0))
-                    init_proto = init_proto + strength * (mapped_proto - init_proto)
-
-                # Z-b: build extra repel set = session_new_protos collected so far
-                novel_protos_extra = None
-                if len(session_new_protos) > 0 and novel_margin_z > 0.0:
-                    novel_protos_extra = torch.stack(session_new_protos).to(device)
-
-                # --- 启动压缩机 (受控版) ---
-                final_proto = optimize_prototype_compactness(
-                    init_proto, cluster_feats,
-                    lr=getattr(args, 'compact_lr', 0.05),
-                    steps=getattr(args, 'compact_steps', 30),
-                    base_protos=base_protos,
-                    base_margin=getattr(args, 'compact_base_margin', 0.2),
-                    novel_protos=novel_protos_extra,
-                    novel_margin=novel_margin_z,
-                    novel_weight=novel_weight_z,
-                )
-                if getattr(args, 'teen_calibration', False):
-                    final_proto = calibrate_novel_prototype(
-                        final_proto, base_protos,
-                        alpha=float(getattr(args, 'teen_alpha', 0.9)),
-                        topk=int(getattr(args, 'teen_topk', 8)),
-                        temperature=float(getattr(args, 'teen_temperature', 0.1)),
-                        preserve_norm=bool(getattr(args, 'teen_preserve_norm', True)),
-                    )
-                projection_strength = float(getattr(args, 'novel_base_projection_strength', 0.0))
-                if projection_strength > 0.0 and base_protos is not None and base_protos.numel() > 0:
-                    with torch.no_grad():
-                        original_norm = final_proto.norm().clamp_min(1e-8)
-                        basis = torch.linalg.qr(base_protos.t().float(), mode='reduced').Q
-                        projected = basis @ (basis.t() @ final_proto.float())
-                        final_proto = final_proto.float() - projection_strength * projected
-                        final_proto = F.normalize(final_proto, dim=0) * original_norm
-                session_new_protos.append(final_proto.detach().clone())
-                session_new_ids.append(int(target_class_id))
-
-                # 更新模型（支持 EMA 融合以利用跨 test_time 的原型历史）
-                ema_alpha = float(getattr(args, 'proto_ema_alpha', 0.0))
-                if ema_alpha > 0.0:
-                    with torch.no_grad():
-                        prev_proto = model.fc.weight.data[target_class_id].detach()
-                        # 若历史原型几乎为零则视为首次初始化，直接覆盖
-                        if prev_proto.abs().sum() < 1e-8:
-                            model.fc.weight.data[target_class_id] = final_proto
-                        else:
-                            model.fc.weight.data[target_class_id] = (
-                                ema_alpha * prev_proto + (1.0 - ema_alpha) * final_proto
-                            )
-                else:
-                    model.fc.weight.data[target_class_id] = final_proto
-
-                if bool(getattr(args, 'stat_memory', False)) and _PROTO_STATS_MEMORY is not None:
-                    _PROTO_STATS_MEMORY.update_novel(
-                        target_class_id, cluster_feats,
-                        shrink=float(getattr(args, 'stat_cov_shrink', 0.7)))
-
-    ridge_refine_novel_prototypes(args, model, session_new_ids)
-
-    if bool(getattr(args, 'stat_memory', False)) and _PROTO_STATS_MEMORY is not None:
-        hard_statistical_replay(args, model, args.num_labeled_classes + args.way)
 
     return acc
 
@@ -1179,12 +987,7 @@ def calibrate_novel_prototype(proto, old_protos, alpha=0.9, topk=8,
 def optimize_prototype_compactness(proto, features, lr=0.05, steps=30,
                                     base_protos=None, base_margin=0.2,
                                     novel_protos=None, novel_margin=0.0, novel_weight=1.0):
-    """
-    使用 MSE Loss 强行压缩，并加入与 base 原型的余弦距离下限约束，
-    防止新类原型被 MSE 压缩到接近任意已有原型（避免 session3 的 known acc 坍塌）。
-    Z-b: 额外支持 novel_protos (同 session 内已更新的新类原型) 的 repel 约束，
-    使 session 内 novel-novel 保持角度分离。
-    """
+    """Refine a support prototype while preserving old/new angular separation."""
     target_proto = proto.detach().clone().requires_grad_(True)
     optimizer = torch.optim.SGD([target_proto], lr=lr, momentum=0.9)
 
@@ -1203,7 +1006,7 @@ def optimize_prototype_compactness(proto, features, lr=0.05, steps=30,
                 violation = torch.clamp(cos_sim - thresh, min=0.0)
                 loss_repel = violation.pow(2).sum()
 
-            # Z-b: novel-novel repel within the same session
+            # Repel prototypes already introduced in the same session.
             loss_novel = torch.tensor(0.0, device=target_proto.device)
             if novel_protos is not None and novel_protos.numel() > 0 and novel_margin > 0.0:
                 p_norm2 = F.normalize(target_proto.unsqueeze(0), dim=-1)
@@ -1221,248 +1024,131 @@ def optimize_prototype_compactness(proto, features, lr=0.05, steps=30,
     return target_proto.detach()
 
 
-def refine_session_prototypes(args, model, data, labels, session=None):
-    """
-    Session-level joint refinement for seen prototypes.
 
-    The existing clustering path only rewrites novel-class prototypes. This helper
-    optionally refines all prototypes that appear in the current evaluation batch,
-    while anchoring base prototypes to their pre-refine positions.
-    """
-    if data is None or labels is None or len(data) == 0 or len(labels) == 0:
-        return 0
+def _install_current_session_prototypes(args, model, device):
+    """Update current class weights exclusively from their five support embeddings."""
+    global _NOVEL_SUPPORT_BANK, _PROTO_STATS_MEMORY
+    support_ids = list(range(
+        int(args.num_labeled_classes),
+        int(args.num_labeled_classes) + int(args.way),
+    ))
+    missing = [class_id for class_id in support_ids
+               if class_id not in _LABELED_SUPPORT_PROTOS]
+    wrong_shots = {
+        class_id: int(_LABELED_SUPPORT_PROTOS[class_id].shape[0])
+        for class_id in support_ids
+        if class_id in _LABELED_SUPPORT_PROTOS
+        and int(_LABELED_SUPPORT_PROTOS[class_id].shape[0]) != 5
+    }
+    if missing or wrong_shots:
+        raise RuntimeError(
+            'Current-session 5-shot supports are required for prototype creation; '
+            f'missing={missing}, wrong_shot_count={wrong_shots}')
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    original_mode = model.mode
-    features_list = []
-    lfc = _get_lfc(device, k_ratio=0.4)
+    base_protos = model.fc.weight[:int(args.num_labeled_classes)].detach().to(device)
+    session_new_protos = []
+    novel_margin = float(getattr(args, 'compact_novel_margin', 0.0))
+    novel_weight = float(getattr(args, 'compact_novel_weight', 1.0))
 
-    try:
-        with torch.no_grad():
-            model.mode = 'incre'
-            for x in data:
-                feat = model.hgnn_encode(x.to(device))
-                feat, _ = lfc(feat)
-                features_list.append(feat.squeeze())
-    finally:
-        model.mode = original_mode
-
-    if len(features_list) == 0:
-        return 0
-
-    features = torch.stack(features_list).to(device)
-    label_tensor = torch.as_tensor(labels, device=device, dtype=torch.long)
-    seen_classes = sorted(set(int(v) for v in label_tensor.detach().cpu().tolist()))
-    if len(seen_classes) == 0:
-        return 0
-
-    base_count = min(int(args.num_labeled_classes), model.fc.weight.size(0))
-    base_snapshot = model.fc.weight[:base_count].detach().clone().to(device)
-    novel_classes = [cls for cls in seen_classes if cls >= base_count]
-
-    # If only base classes are present, there is nothing novel to adapt around.
-    if len(novel_classes) == 0:
-        return 0
-
-    proto_ids = list(range(base_count)) + novel_classes
-    proto_lookup = {cls: idx for idx, cls in enumerate(proto_ids)}
-    proto = model.fc.weight[proto_ids].detach().clone().to(device)
-    proto.requires_grad_(True)
-    optimizer = torch.optim.SGD([proto], lr=float(getattr(args, 'joint_proto_refine_lr', 0.01)), momentum=0.9)
-
-    class_means = {}
-    for cls in seen_classes:
-        cls_mask = label_tensor == cls
-        if cls_mask.any():
-            class_means[cls] = features[cls_mask].mean(dim=0).detach()
-
-    refine_steps = int(getattr(args, 'joint_proto_refine_steps', 10))
-    anchor_weight = float(getattr(args, 'joint_proto_refine_anchor_weight', 0.1))
-    sep_weight = float(getattr(args, 'joint_proto_refine_sep_weight', 0.1))
-    sep_margin = float(getattr(args, 'joint_proto_refine_sep_margin', 0.15))
-
-    eye_mask = None
-    with torch.enable_grad():
-        for _ in range(refine_steps):
-            loss_compact = torch.tensor(0.0, device=device)
-            for cls, cls_mean in class_means.items():
-                loss_compact = loss_compact + F.mse_loss(proto[proto_lookup[cls]], cls_mean)
-
-            loss_anchor = F.mse_loss(proto[:base_count], base_snapshot)
-
-            loss_sep = torch.tensor(0.0, device=device)
-            if proto.size(0) > 1:
-                proto_norm = F.normalize(proto, dim=-1)
-                cos_sim = proto_norm @ proto_norm.t()
-                if eye_mask is None or eye_mask.size(0) != cos_sim.size(0):
-                    eye_mask = torch.eye(cos_sim.size(0), dtype=torch.bool, device=device)
-                off_diag = cos_sim.masked_select(~eye_mask)
-                if off_diag.numel() > 0:
-                    loss_sep = torch.relu(off_diag - sep_margin).pow(2).mean()
-
-            loss = loss_compact + anchor_weight * loss_anchor + sep_weight * loss_sep
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-    with torch.no_grad():
-        model.fc.weight.data[:base_count] = proto[:base_count].detach()
-        for offset, cls in enumerate(novel_classes):
-            model.fc.weight.data[cls] = proto[base_count + offset].detach()
-
-    print(f'  [PROTO-REFINE] session={session} seen={len(seen_classes)} novel={len(novel_classes)} '
-          f'steps={refine_steps} lr={float(getattr(args, "joint_proto_refine_lr", 0.01)):.4f}')
-    return len(seen_classes)
-
-
-def adapt_old_prototypes_after_expansion(args, model, data, labels, session=None):
-    """
-    Adapt old prototypes after new-class prototype expansion.
-
-    Only prototypes in [0, args.num_labeled_classes) are updated. The objective
-    keeps them anchored, pulls classes observed in current known data toward
-    their feature means, and separates every old prototype from the newly added
-    prototypes. A guarded call restores the snapshot if current known accuracy
-    drops after adaptation.
-    """
-    old_count = int(args.num_labeled_classes)
-    new_end = min(old_count + int(args.way), model.fc.weight.size(0))
-    if old_count <= 0 or new_end <= old_count:
-        return 0
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    old_snapshot = model.fc.weight[:old_count].detach().clone().to(device)
-    new_snapshot = model.fc.weight[old_count:new_end].detach().clone().to(device)
-    if new_snapshot.numel() == 0:
-        return 0
-
-    valid_pairs = []
-    if data is not None and labels is not None:
-        valid_pairs = [(x, int(y)) for x, y in zip(data, labels) if int(y) < old_count]
-
-    before_acc = None
-    if getattr(args, 'old_proto_adapt_guard', True) and valid_pairs:
-        before_acc, _ = known_test(args, model, [x for x, _ in valid_pairs], [y for _, y in valid_pairs])
-
-    class_means = {}
-    if valid_pairs:
-        original_mode = model.mode
-        feats_by_class = {}
-        try:
+    for class_id in support_ids:
+        support_bank = _LABELED_SUPPORT_PROTOS[class_id].to(device)
+        _NOVEL_SUPPORT_BANK[class_id] = support_bank.detach().clone()
+        initial_proto = support_bank.mean(dim=0)
+        repel_protos = None
+        if session_new_protos and novel_margin > 0.0:
+            repel_protos = torch.stack(session_new_protos).to(device)
+        final_proto = optimize_prototype_compactness(
+            initial_proto,
+            support_bank,
+            lr=float(getattr(args, 'compact_lr', 0.05)),
+            steps=int(getattr(args, 'compact_steps', 30)),
+            base_protos=base_protos,
+            base_margin=float(getattr(args, 'compact_base_margin', 0.2)),
+            novel_protos=repel_protos,
+            novel_margin=novel_margin,
+            novel_weight=novel_weight,
+        )
+        if bool(getattr(args, 'teen_calibration', False)):
+            final_proto = calibrate_novel_prototype(
+                final_proto,
+                base_protos,
+                alpha=float(getattr(args, 'teen_alpha', 0.9)),
+                topk=int(getattr(args, 'teen_topk', 8)),
+                temperature=float(getattr(args, 'teen_temperature', 0.1)),
+                preserve_norm=bool(getattr(args, 'teen_preserve_norm', True)),
+            )
+        projection_strength = float(
+            getattr(args, 'novel_base_projection_strength', 0.0))
+        if projection_strength > 0.0 and base_protos.numel() > 0:
             with torch.no_grad():
-                model.mode = 'incre'
-                for x, y in valid_pairs:
-                    feat = model.encode(x.to(device)).squeeze()
-                    feats_by_class.setdefault(y, []).append(feat)
-        finally:
-            model.mode = original_mode
+                original_norm = final_proto.norm().clamp_min(1e-8)
+                basis = torch.linalg.qr(base_protos.t().float(), mode='reduced').Q
+                projected = basis @ (basis.t() @ final_proto.float())
+                final_proto = final_proto.float() - projection_strength * projected
+                final_proto = F.normalize(final_proto, dim=0) * original_norm
 
-        for cls, feats in feats_by_class.items():
-            if len(feats) > 0:
-                class_means[cls] = torch.stack(feats).mean(dim=0).detach()
+        session_new_protos.append(final_proto.detach().clone())
+        ema_alpha = float(getattr(args, 'proto_ema_alpha', 0.0))
+        if ema_alpha > 0.0:
+            previous = model.fc.weight.data[class_id].detach()
+            if previous.abs().sum() >= 1e-8:
+                final_proto = ema_alpha * previous + (1.0 - ema_alpha) * final_proto
+        model.fc.weight.data[class_id] = final_proto
+        print(f'  [PROTO-SUPPORT] class={class_id} shots=5 source=current_encoder')
 
-    old_proto = old_snapshot.clone().requires_grad_(True)
-    optimizer = torch.optim.SGD(
-        [old_proto],
-        lr=float(getattr(args, 'old_proto_adapt_lr', 0.01)),
-        momentum=0.9,
-    )
+        if bool(getattr(args, 'stat_memory', False)) and _PROTO_STATS_MEMORY is not None:
+            _PROTO_STATS_MEMORY.update_novel(
+                class_id,
+                support_bank,
+                shrink=float(getattr(args, 'stat_cov_shrink', 0.7)),
+            )
 
-    steps = int(getattr(args, 'old_proto_adapt_steps', 10))
-    anchor_weight = float(getattr(args, 'old_proto_adapt_anchor_weight', 1.0))
-    compact_weight = float(getattr(args, 'old_proto_adapt_compact_weight', 1.0))
-    sep_weight = float(getattr(args, 'old_proto_adapt_sep_weight', 0.1))
-    sep_margin = float(getattr(args, 'old_proto_adapt_sep_margin', 0.35))
+    ridge_refine_novel_prototypes(args, model, support_ids)
+    if bool(getattr(args, 'stat_memory', False)) and _PROTO_STATS_MEMORY is not None:
+        hard_statistical_replay(args, model, int(args.num_labeled_classes) + int(args.way))
+    return support_ids
 
-    with torch.enable_grad():
-        for _ in range(steps):
-            loss_anchor = F.mse_loss(old_proto, old_snapshot)
-
-            loss_compact = torch.tensor(0.0, device=device)
-            for cls, cls_mean in class_means.items():
-                loss_compact = loss_compact + F.mse_loss(old_proto[cls], cls_mean)
-            if len(class_means) > 0:
-                loss_compact = loss_compact / len(class_means)
-
-            old_norm = F.normalize(old_proto, dim=-1)
-            new_norm = F.normalize(new_snapshot.detach(), dim=-1)
-            cos_old_new = old_norm @ new_norm.t()
-            loss_sep = torch.relu(cos_old_new - sep_margin).pow(2).mean()
-
-            loss = anchor_weight * loss_anchor + compact_weight * loss_compact + sep_weight * loss_sep
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-    with torch.no_grad():
-        model.fc.weight.data[:old_count] = old_proto.detach()
-
-    after_acc = None
-    restored = False
-    if before_acc is not None:
-        after_acc, _ = known_test(args, model, [x for x, _ in valid_pairs], [y for _, y in valid_pairs])
-        if after_acc + 1e-8 < before_acc:
-            with torch.no_grad():
-                model.fc.weight.data[:old_count] = old_snapshot
-            restored = True
-
-    msg = (f'  [OLD-PROTO-ADAPT] session={session} old={old_count} new={new_end - old_count} '
-           f'seen_old={len(class_means)} steps={steps} lr={float(getattr(args, "old_proto_adapt_lr", 0.01)):.4f}')
-    if before_acc is not None:
-        msg += f' known_acc={before_acc:.4f}->{after_acc:.4f}'
-    if restored:
-        msg += ' restored'
-    print(msg)
-    return len(class_means)
-# def debug_cluster(args, model, data, labels, session=None):
-#     """改进的特征聚类函数（带时序约束）"""
-#     with torch.no_grad():
-#         features = torch.stack([model.hgnn_encode(x).squeeze() for x in data])  # [N,512,H,W]
-#         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-#         features,_ = LocalFeatureCluster(k_ratio=0.4)(features)
-#         features = features.to(device)
-#         kmeans = KMeans(n_clusters=args.num_unlabeled_classes, n_init=20).fit(features.cpu().numpy())
-        
-#         # 原型更新
-#         y = kmeans.labels_
-#         acc, map = cluster_acc(args, np.array(labels), y)
-        
-#         updated = 0
-#         for cluster_id in np.unique(y):
-#             if cluster_id in map:
-#                 true_label = map[cluster_id]
-#                 if true_label >= args.num_labeled_classes:
-#                     indices = np.where(y == cluster_id)[0]
-#                     if len(indices) > 0:
-#                         new_proto =features[indices].mean(dim=0).to('cuda')  # 使用压缩后的特征
-#                         model.fc.weight.data[true_label] = new_proto
-#                         updated += 1
-    
-#     return acc
-
-_LFC_CACHE = None
-_STRUCTURE_DISCOVERY_MODEL = None
 
 def _get_structure_discovery_model(args, device):
-    global _STRUCTURE_DISCOVERY_MODEL
+    global _STRUCTURE_DISCOVERY_MODEL, _STRUCTURE_DISCOVERY_BANK, _STRUCTURE_DISCOVERY_PATH
     path = str(getattr(args, 'structure_discovery_checkpoint', '') or '')
     if not path or float(getattr(args, 'structure_discovery_weight', 0.0)) <= 0:
-        return None
+        return None, None
+    resolved_path = os.path.abspath(path)
+    if _STRUCTURE_DISCOVERY_PATH != resolved_path:
+        _STRUCTURE_DISCOVERY_MODEL = None
+        _STRUCTURE_DISCOVERY_BANK = None
+        _STRUCTURE_DISCOVERY_PATH = resolved_path
     if _STRUCTURE_DISCOVERY_MODEL is None:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f'Local structure-discovery checkpoint not found: {path}. '
+                'Offline execution never downloads missing checkpoints.')
         structure_model = MYNET(args, mode='extract_feature').to(device)
         payload = torch.load(path, map_location='cpu', weights_only=True)
-        structure_model.load_state_dict(payload.get('params', payload), strict=False)
+        if not isinstance(payload, dict) or 'structure_bank' not in payload:
+            raise KeyError(
+                'structure_discovery_weight>0 requires a checkpoint containing '
+                "payload['structure_bank']; an encoder-only checkpoint is invalid")
+        params = payload.get('params')
+        if not isinstance(params, dict):
+            raise TypeError("structure-discovery checkpoint must contain a 'params' state dict")
+        params = _drop_retired_checkpoint_keys(params, source=path)
+        incompatible = structure_model.load_state_dict(params, strict=False)
+        if incompatible.unexpected_keys:
+            raise RuntimeError(
+                f'Unexpected structure encoder keys in {path}: '
+                f'{incompatible.unexpected_keys[:10]}')
+        structure_bank = LatentStructureReferenceBank.from_state_dict(
+            payload['structure_bank']).to(device)
         structure_model.eval()
         for parameter in structure_model.parameters():
             parameter.requires_grad_(False)
         _STRUCTURE_DISCOVERY_MODEL = structure_model
-        print(f'[STRUCTURE-DISCOVERY] loaded frozen DFSB encoder: {path}')
-    return _STRUCTURE_DISCOVERY_MODEL
-def _get_lfc(device, k_ratio=0.4):
-    global _LFC_CACHE
-    if _LFC_CACHE is None:
-        _LFC_CACHE = LocalFeatureCluster(k_ratio=k_ratio).to(device)
-    return _LFC_CACHE
+        _STRUCTURE_DISCOVERY_BANK = structure_bank
+        print(f'[STRUCTURE-DISCOVERY] loaded frozen encoder and LSRB: {path} '
+              f'clusters={structure_bank.num_clusters} dim={structure_bank.feature_dim}')
+    return _STRUCTURE_DISCOVERY_MODEL, _STRUCTURE_DISCOVERY_BANK
 
 
 def estimate_base_feature_variance(args, model, trainset):
@@ -1807,11 +1493,6 @@ def test(args, model, testloader,  session):
                     choose_novel = probability > 0.5
                     logits[choose_novel, :base_end] = -float('inf')
                     logits[~choose_novel, base_end:] = -float('inf')
-            if getattr(args, 'oracle_eval_group_gate', False) and logits.size(1) > int(args.num_base):
-                base_end = int(args.num_base)
-                diagnostic_novel = test_label >= base_end
-                logits[diagnostic_novel, :base_end] = -float('inf')
-                logits[~diagnostic_novel, base_end:] = -float('inf')
             if (getattr(args, 'incremental_quantile_group_gate', False) and
                     int(session) in _QUANTILE_ROUTER_THRESHOLDS and logits.size(1) > int(args.num_base)):
                 base_end = int(args.num_base)
@@ -1923,6 +1604,7 @@ def known_test(args, model, data, label):
 
 def train(args: dict):   
     # ============ base session training ==============
+    _validate_public_method_args(args)
     device = torch.device("cuda" if args.cuda else "cpu")
     model = MYNET(args, mode='encoder')
     model = model.to(device)
@@ -1939,6 +1621,7 @@ def train(args: dict):
         params = checkpoint.get('params', checkpoint)
         if not isinstance(params, dict):
             raise TypeError('Full checkpoint must be a state dict or contain a params state dict')
+        params = _drop_retired_checkpoint_keys(params, source=full_checkpoint_path)
         incompatible = model.load_state_dict(params, strict=False)
         print(f'    missing_keys={len(incompatible.missing_keys)} '
               f'unexpected_keys={len(incompatible.unexpected_keys)}')
@@ -1957,9 +1640,13 @@ def train(args: dict):
         best_model_dir = args.save_dir+'/'+args.checkpoint_name
         #meta-train negative prototype
         params = torch.load(best_model_dir, weights_only=True)['cls_params']
+        params = _drop_retired_checkpoint_keys(params, source=best_model_dir)
         cls_params = {k: v for k, v in params.items() if 'fc' in k}
         model.cls_classifier.init_representation(cls_params)
         model_dict = model.state_dict()
+        unexpected = sorted(set(params) - set(model_dict))
+        if unexpected:
+            raise RuntimeError(f'Unexpected checkpoint keys in {best_model_dir}: {unexpected[:10]}')
         model_dict.update(params)
         model.load_state_dict(model_dict)
     else:
@@ -1979,11 +1666,13 @@ def train(args: dict):
             if os.path.exists(base_model_path):
                 checkpoint = torch.load(base_model_path)
                 # 加载参数 (使用 strict=False 以防有些不匹配，但通常应该匹配)
-                model.load_state_dict(checkpoint['params'], strict=False)
+                base_params = _drop_retired_checkpoint_keys(
+                    checkpoint['params'], source=base_model_path)
+                model.load_state_dict(base_params, strict=False)
                 # 初始化 cls_classifier.weight_base（兼容旧 checkpoint 只有 fc.weight 的情况）
-                if 'fc.weight' in checkpoint.get('params', {}):
+                if 'fc.weight' in base_params:
                     model.cls_classifier.init_representation(
-                        {'fc.weight': checkpoint['params']['fc.weight']})
+                        {'fc.weight': base_params['fc.weight']})
             else:
                 raise FileNotFoundError(f"Base model not found at {base_model_path}. Please run with --load_base False first.")
                 
@@ -2124,33 +1813,13 @@ def train(args: dict):
                     _, unlabelled_loader = get_mixed_openworld_dataloader(args, session)
                 else:
                     _,unlabelled_loader = get_dataloader(args, session)
-                # Labeled few-shot support episode. It is the only source used
-                # for novel class IDs; test-stream labels never enter mapping.
-                if getattr(args, 'mixed_openworld_stream', False) and \
-                        str(getattr(args, 'discovery_encoder', 'hgnn_lfc')) == 'direct':
-                    support_targets = np.asarray(getattr(unlabelled_loader.dataset, 'targets', []))
-                    support_ids = np.arange(args.num_base + (session - 1) * args.way,
-                                            args.num_base + session * args.way)
-                    with torch.no_grad():
-                        model.mode = 'incre'
-                        for cls_id in support_ids:
-                            idx = np.flatnonzero(support_targets == cls_id)[:max(1, int(args.n_shots))]
-                            if len(idx):
-                                emb = []
-                                for ii in idx:
-                                    sample = unlabelled_loader.dataset[int(ii)][0].unsqueeze(0).cuda()
-                                    emb.append(encode_with_deterministic_tta(
-                                        model, sample, int(getattr(args, 'encode_tta_views', 1))).squeeze(0))
-                                # Preserve every current model.encode support
-                                # embedding. The classifier uses their mean, while
-                                # the bank classifier can average top-k support
-                                # similarities instead of collapsing the 5-shot
-                                # episode to one vector.
-                                _LABELED_SUPPORT_PROTOS[int(cls_id)] = torch.stack(emb).detach()
-                    print(f'  [SUPPORT-ENCODE] session={session} classes={sorted(_LABELED_SUPPORT_PROTOS)} '
-                          f'shots={max(1, int(args.n_shots))} source=model.encode')
+                # Materialize the one support episode once, so prototype creation
+                # and OSR see the same five sampled waveforms for every class.
+                session_batches = list(unlabelled_loader)
+                _encode_current_session_supports(args, model, session_batches, session)
                 #OSR_DETECTION
-                unknow_data,unknow_label,know_data,know_label=run_test_fsl(model,args,unlabelled_loader, session=session)
+                unknow_data,unknow_label,know_data,know_label=run_test_fsl(
+                    model, args, session_batches, session=session)
                 # Extract per-session AUROC from function attribute
                 auroc_list = getattr(run_test_fsl, '_auroc_list', [])
                 session_auroc = float(np.mean(auroc_list)) if auroc_list else 0.0
@@ -2196,8 +1865,7 @@ def train(args: dict):
                         with torch.no_grad():
                             for sample, diagnostic_label in all_pairs:
                                 model.mode = 'extract_feature'
-                                embedding = encode_with_deterministic_tta(
-                                    model, sample.cuda(), int(getattr(args, 'encode_tta_views', 1)))
+                                embedding = model.encode(sample.to(device))
                                 joint_layer = str(getattr(args, 'joint_cluster_layer', 'layer4'))
                                 if joint_layer in ('layer4', 'layer4_lda'):
                                     joint_feature = embedding
@@ -2359,11 +2027,9 @@ def train(args: dict):
                         print(f'  [DISCOVERY-REFLOW] selected={count}/{len(know_data)} '
                               f'quantile={reflow_q:.3f} rejected={len(unknow_data)} '
                               f'reject_fraction={rejected_fraction:.3f} total={len(discovery_data)}')
-                cluster_acc=debug_cluster(args,model,discovery_data,discovery_label,session)
-                if getattr(args, 'old_proto_adapt', False):
-                    adapt_old_prototypes_after_expansion(args, model, know_data, know_label, session=session)
-                if getattr(args, 'joint_proto_refine', False):
-                    refine_session_prototypes(args, model, know_data + unknow_data, know_label + unknow_label, session=session)
+                cluster_acc = discover_and_register(
+                    args, model, discovery_data, discovery_label, session
+                )
                 acc_known, _ = known_test(args, model, know_data, know_label)
                 fscore=calc(args,know_label,unknow_label)
                 result['sess{}_ak'.format(session)]+=[acc_known]
@@ -2649,7 +2315,9 @@ def base_train(args, model):
         if not os.path.isfile(init_checkpoint):
             raise FileNotFoundError(f'base_init_checkpoint is not local: {init_checkpoint}')
         init_state = torch.load(init_checkpoint, map_location='cpu', weights_only=True)
-        model.load_state_dict(init_state.get('params', init_state), strict=True)
+        init_params = _drop_retired_checkpoint_keys(
+            init_state.get('params', init_state), source=init_checkpoint)
+        model.load_state_dict(init_params, strict=True)
         print(f'[BASE-INIT] loaded current encoder from {init_checkpoint}')
     optimizer, scheduler = get_optimizer(model, args)
     finetune_lr = float(getattr(args, 'base_finetune_lr', 0.0))
@@ -2724,7 +2392,9 @@ def base_train(args, model):
                 print(f"[BASE-VAL] early stop at epoch={epoch}; best_val={best_val:.4f}")
                 break
         checkpoint = torch.load(save_model_path, map_location='cpu')
-        model.load_state_dict(checkpoint['params'], strict=True)
+        saved_params = _drop_retired_checkpoint_keys(
+            checkpoint['params'], source=save_model_path)
+        model.load_state_dict(saved_params, strict=True)
         print(f"Base training finished. Best validation model saved to {save_model_path}")
         return save_model_path
     

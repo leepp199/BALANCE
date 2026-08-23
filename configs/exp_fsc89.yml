@@ -11,7 +11,7 @@ train:
   seq_sample: false
   tmp_train: true
   feat_dim: 512
-  save_dir: /data/lqq/baseline/save/exp_fsc89/
+  save_dir: checkpoints/fsc89/
   seed: 3420
   n_ways: 5
   n_open_ways: 5

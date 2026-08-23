@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from models.dfsb import MaskedStructurePredictor
+from models.lsrb import MaskedStructurePredictor
 
 
 class MaskedStructurePredictorTest(unittest.TestCase):

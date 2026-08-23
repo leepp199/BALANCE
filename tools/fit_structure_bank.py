@@ -16,8 +16,8 @@ from sklearn.cluster import MiniBatchKMeans
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from models.dfsb import DeepFeatureStructureBank
-from tools.dfsb_common import atomic_torch_save
+from models.lsrb import LatentStructureReferenceBank
+from tools.lsrb_common import atomic_torch_save
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,7 +55,7 @@ def main() -> None:
     )
     kmeans.fit(descriptors.numpy())
     centers = torch.from_numpy(kmeans.cluster_centers_).float()
-    bank = DeepFeatureStructureBank(centers, temperature=cli.temperature)
+    bank = LatentStructureReferenceBank(centers, temperature=cli.temperature)
     atomic_torch_save(bank.state_dict(), cli.output)
 
     extraction = {}

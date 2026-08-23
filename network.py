@@ -9,12 +9,10 @@ from speechbrain.processing.features import STFT, Filterbank
 from models.resnet18_encoder import resnet18
 from utils.utils import count_acc,Averager
 import tqdm,os
-from models.feature_enhancer import EnhancedLocalFeature
 from models.AttnClassifier import Classifier
 from sklearn.cluster import KMeans
 from scipy.optimize import linear_sum_assignment
 import numpy as np
-from models.resnet_enhancer import LocalFeatureCluster
 class MYNET(nn.Module):
 
     def __init__(self,args, mode=None):
@@ -35,8 +33,6 @@ class MYNET(nn.Module):
         self.transatt_proto = MultiHeadAttention(1, hdim, hdim, hdim, dropout=0.5)
         self.cls_classifier = Classifier(args, self.num_features,args.train_weight_base) # 分类器 
         self.set_module_for_audio(args) # 音频模块的设置（可能涉及音频特征）
-        # self.cluster_loss_weight = 0.5  # 可配置参数
-        self.feature_enhance = LocalFeatureCluster(feat_dim=64, k_ratio=0.3)
     def forward(self,input,labels=None, conj_ids=None, base_ids=None, test=False):
         # 定义前向传播过程 
         if self.mode == 'encoder':# 如果模式是'encoder'，则只进行编码
@@ -411,28 +407,7 @@ class MYNET(nn.Module):
     def get_featmap(self, input):
         """Backward-compatible alias for the verified layer4 extraction path."""
         return self.forward_to_layer4(input, augment=False)
-    def enhance_encode(self,x):
-        x = self.spectrogram_extractor(x)   # (batch_size, 1, time_steps, freq_bins)
-        x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
-        x = x.transpose(1, 3)
-        x = self.bn0(x)
-        x = x.transpose(1, 3)
-        x = x.repeat(1, 3, 1, 1)
 
-        x = self.encoder.conv1(x)
-        x = self.encoder.bn1(x)
-        x = self.encoder.relu(x)
-        x = self.encoder.layer1(x)
-        x = self.feature_enhance(x) 
-        x = self.encoder.layer2(x)
-        x = self.encoder.layer3(x)               # (B, C, H, W) <- 保留空间维度  
-
-        x = self.encoder.layer4(x)
-        x = F.adaptive_avg_pool2d(x, 1)
-        x = x.squeeze(-1).squeeze(-1)
-        if self.mode=="encoder":
-            x = self.fc(x)
-        return x       
     def pre_encode(self, x):
         x = self.spectrogram_extractor(x)   # (batch_size, 1, time_steps, freq_bins)
         x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)

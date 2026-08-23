@@ -23,6 +23,11 @@ outputs/
 third_party/
 repro_baselines/official_code/
 paper/
+docs/
+experiments/
+diagnose/
+repro_baselines/
+models/baselines/
 *.docx
 *.bak
 extract_log.txt
@@ -31,6 +36,34 @@ wandb/
 tensorboard/
 *.log
 *.out
+
+# Private research notes and machine-specific launch state
+center_shifts*.csv
+final_exp_summary.md
+monitor_and_launch.sh
+orchestrator.sh
+readme
+.env
+.env.*
+configs/local*.yml
+configs/local*.yaml
+
+# Public release whitelist: keep screening and retired implementation files local
+configs/*
+!configs/exp_ls100.yml
+!configs/exp_ns100.yml
+!configs/exp_fsc89.yml
+scripts/*
+!scripts/offline_preflight.sh
+!scripts/run_fowac.sh
+tools/background_continue.sh
+models/feature_enhancer.py
+models/resnet_enhancer.py
+models/robust_proto_adapter.py
+enhance_module.py
+openmax.py
+utils/streamCluster.py
+utils/audio_augment.py
 
 # Local editor/OS files
 .vscode/

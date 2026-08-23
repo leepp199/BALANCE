@@ -1,9 +1,9 @@
 train:
   model:
-    feature_structure_mode: none  # none | old_cffm | dfsb
+    feature_structure_mode: none  # none | lsrb
   structure_bank:
     enabled: false
-    path: /data/lqq/baseline_dfsb/artifacts/structure_banks/structure_bank.pt
+    path: artifacts/structure_banks/lsrb_ls100.pt
     num_clusters: 128
     temperature: 0.1
     max_descriptors: 200000
@@ -24,7 +24,7 @@ train:
   seq_sample: false
   tmp_train: true
   feat_dim: 512
-  save_dir: /data/lqq/baseline/save/exp_ls100/
+  save_dir: checkpoints/ls100/
   seed: 3420
   n_ways: 5
   n_open_ways: 5
