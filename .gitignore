@@ -7,6 +7,7 @@ __pycache__/
 # Local environments and downloaded model/data caches
 .offline_torch/
 .cache/
+.qoder/
 artifacts/
 checkpoints/
 *.pth
@@ -19,6 +20,12 @@ save_result/
 repro_baselines/results/
 figures/
 outputs/
+third_party/
+repro_baselines/official_code/
+*.docx
+*.bak
+extract_log.txt
+urec_out.txt
 wandb/
 tensorboard/
 *.log

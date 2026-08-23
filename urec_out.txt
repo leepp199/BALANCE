@@ -1,6 +1,0 @@
-Total rounds: 40
-S1: mean=0.952  min=0.88  max=1.00
-S2: mean=0.948  min=0.84  max=1.00
-S3: mean=0.616  min=0.44  max=0.80
-S4: mean=0.784  min=0.56  max=0.96
-Overall U_recall: 0.825
