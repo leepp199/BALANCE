@@ -3,6 +3,7 @@ import os
 os.environ['PYTHONHASHSEED'] = str(42)
 os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 import argparse
+import hashlib
 import random
 import yaml
 import torch
@@ -77,6 +78,9 @@ _PRECOMPUTED_DISCOVERY_ASSIGNMENTS = None
 _STRUCTURE_DISCOVERY_MODEL = None
 _STRUCTURE_DISCOVERY_BANK = None
 _STRUCTURE_DISCOVERY_PATH = None
+_BASE_PROTECTION_GEOMETRY_CACHE = {}
+_BASE_PROTECTION_CALIBRATION_CACHE = {}
+_LOCAL_FILE_SHA256_CACHE = {}
 
 _RETIRED_CHECKPOINT_PREFIXES = ('feature_enhance.',)
 
@@ -411,6 +415,18 @@ def args_parser():
                         help='Route between base and novel groups using their label-free top1-top2 cosine margins.')
     parser.add_argument('--incremental_group_margin_bias', type=float, default=0.0,
                         help='Bias added to the novel-group confidence margin.')
+    parser.add_argument('--incremental_base_protection', type=_str2bool, default=False,
+                        help='One-sided base-class protection calibrated from offline base-validation '
+                             'embeddings and leave-one-out current-encoder novel supports. It can '
+                             'rescue an anchor novel prediction to base, but never routes base to novel.')
+    parser.add_argument('--incremental_base_protection_loo_recall', type=float, default=0.95,
+                        help='Minimum leave-one-out novel-support recall retained while selecting '
+                             'the one-sided base-protection threshold.')
+    parser.add_argument('--incremental_base_protection_chunk_size', type=int, default=2048,
+                        help='Chunk size for offline base-validation score calibration.')
+    parser.add_argument('--incremental_margin_gate_path', type=str, default='',
+                        help='Offline validation artifact containing the frozen threshold for '
+                             'max-novel minus max-base cosine routing.')
     parser.add_argument('--incremental_osr_group_gate', type=_str2bool, default=False,
                         help='Route base/novel predictions with the trained positive-negative OSR margin.')
     parser.add_argument('--incremental_group_router_path', type=str, default='',
@@ -461,6 +477,9 @@ def args_parser():
                         help='Reset model state before every independent evaluation repeat. '
                              'Must remain True for publishable results; False leaks novel '
                              'prototypes across repeats and inflates later rounds.')
+    parser.add_argument('--cache_eval_features', type=_str2bool, default=True,
+                        help='Cache deterministic current-encoder test embeddings in RAM across '
+                             'repeats. This changes runtime only; supports and streams are resampled.')
     parser.add_argument('--skip_meta_train', type=_str2bool, default=False,
                         help='If True, skip meta_train call and use the loaded checkpoint directly (for fast eval-only iteration).')
     parser.add_argument('--checkpoint_name', type=str, default='epoch_5.pth',
@@ -587,6 +606,9 @@ def args_parser():
                              'its trained base classifier, keeping discovery and prototype spaces consistent.')
     parser.add_argument('--base_geometry_path', type=str, default='',
                         help='Local offline validation geometry produced by build_fsc_base_stats.py.')
+    parser.add_argument('--base_geometry_sha256', type=str, default='',
+                        help='Expected SHA-256 of --base_geometry_path. Required by the '
+                             'one-sided base-protection path.')
     parser.add_argument('--joint_cluster_layer', choices=['layer2', 'layer3', 'layer4', 'layer4_lda',
                                                           'layer4_layer3'], default='layer4',
                         help='Stage from the same trained encoder used for joint CANA structure clustering. '
@@ -660,6 +682,114 @@ def args_parser():
     return parser
 
 
+def _sha256_local_file(path):
+    """Hash a local artifact once per immutable file-stat identity."""
+    resolved = os.path.abspath(os.fspath(path))
+    stat = os.stat(resolved)
+    key = (resolved, int(stat.st_size), int(stat.st_mtime_ns))
+    cached = _LOCAL_FILE_SHA256_CACHE.get(key)
+    if cached is not None:
+        return cached
+    digest = hashlib.sha256()
+    with open(resolved, 'rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    value = digest.hexdigest()
+    _LOCAL_FILE_SHA256_CACHE[key] = value
+    return value
+
+
+def _validate_margin_gate_payload(args, gate, errors):
+    """Validate the hash-linked, leakage-sensitive FSC-89 gate contract."""
+    required_gate_values = {
+        'schema_version': 1,
+        'artifact_type': 'fsc89_pseudo_unseen_margin_gate',
+        'dataset': str(args.dataset),
+        'dataset_protocol': 'FSC-89',
+        'feature_api': 'model.encode',
+        'final_num_base': int(args.num_base),
+        'calibration_encoder_num_base': 59,
+        'base_prototype_source': 'train_mean_from_same_encoder',
+        'novel_prototype_source': 'exactly_5_shot_mean_from_same_encoder',
+        'shot': 5,
+        'score': 'novel_max_minus_base_max_mean_prototype_cosine',
+        'score_name': 'novel_top1_cosine_minus_base_top1_cosine',
+        'score_pipeline': {
+            'metric': 'cosine',
+            'feature_centering': False,
+            'base_logits': 'same_encoder_train_mean_prototypes',
+            'novel_logits': 'same_encoder_exact_5_shot_mean_prototypes',
+            'aggregation_stage': 'before_support_bank_or_logit_bias',
+        },
+        'decision_rule': 'choose_novel_if_score_greater_than_or_equal_to_threshold',
+        'support_shots': 5,
+        'deployment_session_ways': [5, 10, 15, 20],
+        'base_fc_source': 'train_mean',
+        'calibration_split_disjoint': True,
+        'support_query_split_disjoint': True,
+        'calibration_audit_feature_split_disjoint': True,
+        'test_classes_accessed': [],
+        'training_classes_zero_based': list(range(59)),
+        'validation_classes_zero_based': list(range(59, 69)),
+        'sealed_test_classes_zero_based': list(range(69, 89)),
+    }
+    for key, expected in required_gate_values.items():
+        if gate.get(key) != expected:
+            errors.append(
+                f'--incremental_margin_gate_path has invalid {key}: '
+                f'expected {expected!r}, got {gate.get(key)!r}')
+    for key in ('checkpoint_sha256', 'calibration_checkpoint_sha256',
+                'geometry_sha256'):
+        value = str(gate.get(key, ''))
+        if (len(value) != 64 or
+                any(char not in '0123456789abcdef' for char in value.lower())):
+            errors.append(f'--incremental_margin_gate_path has invalid {key}')
+
+    support_draws = gate.get('support_draw_audit')
+    if not isinstance(support_draws, list) or not support_draws:
+        errors.append('--incremental_margin_gate_path is missing support_draw_audit')
+    else:
+        for draw in support_draws:
+            by_class = draw.get('support_indices_by_class', {}) \
+                if isinstance(draw, dict) else {}
+            invalid_draw = (
+                not by_class or
+                int(draw.get('ways', -1)) != len(by_class) or
+                any(len(indices) != 5 or len(set(indices)) != 5
+                    for indices in by_class.values())
+            )
+            if invalid_draw:
+                errors.append(
+                    '--incremental_margin_gate_path support_draw_audit is not exact 5-shot')
+                break
+
+    gate_inference_constraints = (
+        ('--skip_replace_base_fc must be False for train-mean gate geometry',
+         not bool(getattr(args, 'skip_replace_base_fc', False))),
+        ('--incremental_metric must be cosine for the margin gate',
+         str(getattr(args, 'incremental_metric', 'cosine')) == 'cosine'),
+        ('--feature_centering must be False for the uncentered margin gate',
+         not bool(getattr(args, 'feature_centering', False))),
+        ('--orth_base_proto must be False for train-mean gate geometry',
+         not bool(getattr(args, 'orth_base_proto', False))),
+        ('--compact_steps must be 0 for exact 5-shot mean gate geometry',
+         int(getattr(args, 'compact_steps', 30)) == 0),
+        ('--teen_calibration must be False for exact 5-shot mean gate geometry',
+         not bool(getattr(args, 'teen_calibration', False))),
+        ('--novel_base_projection_strength must be 0 for exact 5-shot mean gate geometry',
+         abs(float(getattr(args, 'novel_base_projection_strength', 0.0))) <= 1e-12),
+        ('--ridge_novel_refine must be False for exact 5-shot mean gate geometry',
+         not bool(getattr(args, 'ridge_novel_refine', False))),
+        ('--stat_memory must be False for frozen mean-prototype gate geometry',
+         not bool(getattr(args, 'stat_memory', False))),
+        ('--use_pan_incremental must be False for mean-prototype margin gating',
+         not bool(getattr(args, 'use_pan_incremental', False))),
+    )
+    for message, valid in gate_inference_constraints:
+        if not valid:
+            errors.append(message)
+
+
 def _validate_public_method_args(args):
     """Reject legacy prototype paths that are not part of the public method."""
     errors = []
@@ -679,10 +809,80 @@ def _validate_public_method_args(args):
         errors.append('--encode_tta_views must be 1 for the single current-encoder path')
     if abs(float(getattr(args, 'support_proto_blend', 1.0)) - 1.0) > 1e-12:
         errors.append('--support_proto_blend must be 1.0; stream features cannot enter prototypes')
+    if abs(float(getattr(args, 'proto_ema_alpha', 0.0))) > 1e-12:
+        errors.append('--proto_ema_alpha must be 0; first-use novel rows have no valid history to blend')
+    if not bool(getattr(args, 'reset_fc_each_round', True)):
+        errors.append('--reset_fc_each_round must be True to prevent cross-repeat prototype leakage')
     if bool(getattr(args, 'oracle_cluster', False)):
         errors.append('--oracle_cluster=True reads evaluation labels and is not supported')
     if bool(getattr(args, 'oracle_eval_group_gate', False)):
         errors.append('--oracle_eval_group_gate=True reads evaluation labels and is not supported')
+    margin_gate_path = str(getattr(args, 'incremental_margin_gate_path', '') or '')
+    if margin_gate_path:
+        if not os.path.isfile(margin_gate_path):
+            errors.append(f'--incremental_margin_gate_path does not exist: {margin_gate_path}')
+        else:
+            gate = torch.load(margin_gate_path, map_location='cpu', weights_only=True)
+            if not isinstance(gate, dict):
+                errors.append('--incremental_margin_gate_path must contain a metadata dictionary')
+                gate = {}
+            if gate.get('offline') is not True:
+                errors.append('--incremental_margin_gate_path must declare offline=True')
+            if str(gate.get('encoder', '')) != 'current model.encode':
+                errors.append('--incremental_margin_gate_path must be calibrated with current model.encode')
+            if 'margin_threshold' not in gate:
+                errors.append('--incremental_margin_gate_path is missing margin_threshold')
+            elif not math.isfinite(float(gate['margin_threshold'])):
+                errors.append('--incremental_margin_gate_path has a non-finite margin_threshold')
+            # The schema binds the pseudo-unseen split, exact five-shot draws,
+            # checkpoint/geometry hashes, and the score pipeline used below.
+            _validate_margin_gate_payload(args, gate, errors)
+    if bool(getattr(args, 'incremental_base_protection', False)):
+        geometry_path = str(getattr(args, 'base_geometry_path', '') or '')
+        recall_floor = float(getattr(args, 'incremental_base_protection_loo_recall', 0.95))
+        chunk_size = int(getattr(args, 'incremental_base_protection_chunk_size', 2048))
+        if str(getattr(args, 'incremental_metric', 'cosine')) != 'cosine':
+            errors.append('--incremental_base_protection requires --incremental_metric cosine')
+        if not geometry_path or not os.path.isfile(geometry_path):
+            errors.append('--incremental_base_protection requires an existing --base_geometry_path')
+        expected_geometry_sha = str(
+            getattr(args, 'base_geometry_sha256', '') or '').strip().lower()
+        if (len(expected_geometry_sha) != 64 or
+                any(char not in '0123456789abcdef' for char in expected_geometry_sha)):
+            errors.append(
+                '--incremental_base_protection requires a valid --base_geometry_sha256')
+        elif geometry_path and os.path.isfile(geometry_path):
+            actual_geometry_sha = _sha256_local_file(geometry_path)
+            if actual_geometry_sha != expected_geometry_sha:
+                errors.append(
+                    '--base_geometry_sha256 does not match --base_geometry_path: '
+                    f'expected {expected_geometry_sha}, got {actual_geometry_sha}')
+        if not (0.0 < recall_floor <= 1.0):
+            errors.append('--incremental_base_protection_loo_recall must be in (0, 1]')
+        if chunk_size <= 0:
+            errors.append('--incremental_base_protection_chunk_size must be positive')
+        if bool(getattr(args, 'skip_replace_base_fc', False)):
+            errors.append('--incremental_base_protection requires formal train-mean base prototypes')
+        if bool(getattr(args, 'orth_base_proto', False)):
+            errors.append('--incremental_base_protection is incompatible with --orth_base_proto')
+        incompatible = []
+        if margin_gate_path:
+            incompatible.append('--incremental_margin_gate_path')
+        for path_arg in ('incremental_group_router_path', 'incremental_tree_router_path'):
+            if str(getattr(args, path_arg, '') or ''):
+                incompatible.append(f'--{path_arg}')
+        for flag_arg in ('incremental_group_margin_gate', 'incremental_osr_group_gate',
+                         'incremental_quantile_group_gate', 'incremental_sinkhorn_balance',
+                         'use_pan_incremental', 'feature_centering'):
+            if bool(getattr(args, flag_arg, False)):
+                incompatible.append(f'--{flag_arg}')
+        if abs(float(getattr(args, 'incremental_radius_power', 0.0))) > 1e-12:
+            incompatible.append('--incremental_radius_power')
+        if abs(float(getattr(args, 'incremental_proto_hubness_weight', 0.0))) > 1e-12:
+            incompatible.append('--incremental_proto_hubness_weight')
+        if incompatible:
+            errors.append('--incremental_base_protection cannot be combined with another hard/geometry '
+                          'router: ' + ', '.join(incompatible))
     if not bool(getattr(args, 'session_restricted_alignment', True)):
         errors.append('--session_restricted_alignment=False is a retired label-alignment audit')
     if bool(getattr(args, 'joint_proto_refine', False)):
@@ -1203,6 +1403,40 @@ _TREE_ROUTER_CACHE = {}
 _RADIUS_CACHE = {}
 _QUANTILE_ROUTER_THRESHOLDS = {}
 _SINKHORN_CLASS_BIASES = {}
+_MARGIN_GATE_CACHE = {}
+_EVAL_FEATURE_CACHE = {}
+
+
+def _eval_dataset_fingerprint(dataset):
+    """Return a stable identity for the exact ordered evaluation set.
+
+    The previous cache key only kept the target count and min/max label.  Two
+    different splits (or two subsets with the same summary statistics) could
+    therefore reuse the wrong embeddings.  Targets plus ordered local sample
+    paths make the cache independent of object identity while still reusable
+    across the freshly constructed loaders in every evaluation repeat.
+    """
+    digest = hashlib.sha256()
+    dataset_type = f'{type(dataset).__module__}.{type(dataset).__qualname__}'
+    digest.update(dataset_type.encode('utf-8'))
+    for attr in ('phase', 'partition'):
+        digest.update(str(getattr(dataset, attr, '')).encode('utf-8'))
+        digest.update(b'\0')
+    targets = np.asarray(getattr(dataset, 'targets', ()), dtype=np.int64)
+    digest.update(targets.tobytes())
+    for attr in ('data', 'datapath'):
+        values = getattr(dataset, attr, None)
+        if not isinstance(values, (list, tuple)) or not values:
+            continue
+        # Evaluation datasets in this repository store local audio paths here.
+        # Do not hash tensor payloads if a future dataset uses ``data`` for RAM
+        # samples; targets and the remaining metadata still form a safe key.
+        if all(isinstance(value, (str, os.PathLike)) for value in values):
+            for value in values:
+                digest.update(os.fspath(value).encode('utf-8'))
+                digest.update(b'\0')
+            break
+    return digest.hexdigest()
 
 
 def _incremental_cosine_bank_logits(args, model, data, test_class):
@@ -1220,11 +1454,232 @@ def _incremental_cosine_bank_logits(args, model, data, test_class):
     return logits
 
 
+def _load_base_protection_geometry(args, feature_dim):
+    """Load only offline current-encoder base-validation embeddings."""
+    path = os.path.abspath(str(getattr(args, 'base_geometry_path', '') or ''))
+    expected_sha = str(getattr(args, 'base_geometry_sha256', '') or '').strip().lower()
+    actual_sha = _sha256_local_file(path)
+    if actual_sha != expected_sha:
+        raise ValueError(
+            f'base-protection geometry SHA-256 mismatch: expected {expected_sha}, got {actual_sha}')
+    stat = os.stat(path)
+    cache_key = (path, int(stat.st_size), int(stat.st_mtime_ns),
+                 actual_sha, int(args.num_base), int(feature_dim))
+    cached = _BASE_PROTECTION_GEOMETRY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    payload = torch.load(path, map_location='cpu', weights_only=True)
+    if not isinstance(payload, dict) or payload.get('offline') is not True:
+        raise ValueError('base-protection geometry must be an offline metadata dictionary')
+    if str(payload.get('split', '')) != 'FMC val':
+        raise ValueError("base-protection geometry must declare split='FMC val'")
+    if str(payload.get('encoder', '')) != 'model.encode':
+        raise ValueError("base-protection geometry must declare encoder='model.encode'")
+    if payload.get('test_csv_opened', False) is not False:
+        raise ValueError('base-protection geometry must not open the FSC-89 test CSV')
+    if int(payload.get('encoded_class_max', 68)) > 68:
+        raise ValueError('base-protection geometry encoded_class_max must be <= 68')
+    if list(payload.get('test_classes_accessed', [])):
+        raise ValueError('base-protection geometry must not access test classes')
+    payload_dataset = str(payload.get('dataset', '') or '')
+    if payload_dataset and payload_dataset not in {'FMC', 'FSC-89'}:
+        raise ValueError(f'invalid base-protection geometry dataset={payload_dataset!r}')
+    class_features = payload.get('class_features')
+    base_end = int(args.num_base)
+    if not isinstance(class_features, (list, tuple)) or len(class_features) != base_end:
+        raise ValueError(
+            f'base-protection geometry needs exactly {base_end} class feature pools')
+    centers = torch.as_tensor(payload.get('centers')).detach().float().cpu()
+    if (centers.ndim != 2 or tuple(centers.shape) != (base_end, int(feature_dim)) or
+            not torch.isfinite(centers).all()):
+        raise ValueError(
+            f'base-protection geometry needs finite centers[{base_end},{feature_dim}]')
+
+    pools = []
+    for class_id, value in enumerate(class_features[:base_end]):
+        features = torch.as_tensor(value).detach().float().cpu().contiguous()
+        if features.ndim != 2 or features.shape[0] == 0 or features.shape[1] != feature_dim:
+            raise ValueError(
+                f'invalid base-validation embeddings for class {class_id}: '
+                f'expected [N,{feature_dim}], got {tuple(features.shape)}')
+        if not torch.isfinite(features).all():
+            raise ValueError(f'non-finite base-validation embeddings for class {class_id}')
+        pools.append(features)
+    cached = {'cache_key': cache_key, 'class_features': tuple(pools)}
+    _BASE_PROTECTION_GEOMETRY_CACHE[cache_key] = cached
+    return cached
+
+
+def _base_conformity_reference(base_prototypes, class_features):
+    """Build per-class empirical CDFs of same-class validation cosine scores."""
+    base_unit = F.normalize(base_prototypes.detach().float(), dim=1)
+    references = []
+    for class_id, pool_cpu in enumerate(class_features):
+        pool = pool_cpu.to(base_unit.device, non_blocking=True)
+        similarity = F.normalize(pool, dim=1) @ base_unit[class_id]
+        references.append(similarity.sort().values.contiguous())
+    return base_unit, tuple(references)
+
+
+def _base_conformity_scores(query, base_unit, references):
+    """Empirical percentile of top-base cosine under that base class."""
+    if query.ndim != 2 or query.shape[1] != base_unit.shape[1]:
+        raise ValueError('base-conformity query dimension does not match base prototypes')
+    similarity = F.normalize(query.float(), dim=1) @ base_unit.t()
+    top_score, top_class = similarity.max(dim=1)
+    conformity = torch.empty_like(top_score)
+    for class_id in top_class.unique(sorted=True).tolist():
+        mask = top_class == int(class_id)
+        reference = references[int(class_id)]
+        rank = torch.searchsorted(reference, top_score[mask].contiguous(), right=True)
+        conformity[mask] = rank.to(top_score.dtype) / float(reference.numel())
+    return conformity, top_class, top_score
+
+
+def _leave_one_out_support_observations(banks):
+    """Return each support query and its cosine to the other four supports."""
+    heldout, consistency = [], []
+    for bank in banks:
+        if bank.ndim != 2 or int(bank.shape[0]) != 5:
+            raise ValueError('leave-one-out calibration requires an exact five-shot bank')
+        bank = bank.float()
+        loo_prototypes = (bank.sum(dim=0, keepdim=True) - bank) / 4.0
+        heldout.append(bank)
+        consistency.append(F.cosine_similarity(bank, loo_prototypes, dim=1))
+    return torch.cat(heldout, dim=0), torch.cat(consistency, dim=0)
+
+
+def _select_base_protection_threshold(base_scores, loo_novel_scores, min_loo_recall):
+    """Maximize base rescue subject to retaining the requested LOO novel recall.
+
+    A sample is rescued to base when its conformity is greater than or equal to
+    the selected threshold.  ``loo_novel_scores`` are support observations held
+    out one at a time; no test example or test label enters this selection.
+    """
+    base_scores = torch.as_tensor(base_scores).detach().float().flatten()
+    novel_scores = torch.as_tensor(loo_novel_scores).detach().float().flatten()
+    recall_floor = float(min_loo_recall)
+    if base_scores.numel() == 0 or novel_scores.numel() == 0:
+        raise ValueError('base-protection calibration requires non-empty base and novel scores')
+    if not torch.isfinite(base_scores).all() or not torch.isfinite(novel_scores).all():
+        raise ValueError('base-protection calibration scores must be finite')
+    if not (0.0 < recall_floor <= 1.0):
+        raise ValueError('min_loo_recall must be in (0, 1]')
+
+    # Retention uses score < threshold, whereas rescue uses score >= threshold.
+    # Moving each observed value one representable step upward gives exact,
+    # deterministic empirical recall even when percentile scores are tied.
+    unique_scores = torch.unique(novel_scores).sort().values
+    candidates = torch.nextafter(unique_scores, torch.full_like(unique_scores, float('inf')))
+    required_retained = int(math.ceil(recall_floor * novel_scores.numel() - 1e-12))
+    records = []
+    for threshold in candidates:
+        retained = int((novel_scores < threshold).sum().item())
+        if retained < required_retained:
+            continue
+        loo_recall = retained / float(novel_scores.numel())
+        base_rescue = (base_scores >= threshold).float().mean()
+        records.append((float(base_rescue), loo_recall, float(threshold)))
+    if not records:
+        raise RuntimeError('no threshold satisfies the requested LOO novel recall')
+
+    # Base rescue is the primary objective.  On a plateau, prefer the safer
+    # threshold with higher novel recall, then the larger threshold.
+    best_base = max(record[0] for record in records)
+    records = [record for record in records if abs(record[0] - best_base) <= 1e-12]
+    best_recall = max(record[1] for record in records)
+    records = [record for record in records if abs(record[1] - best_recall) <= 1e-12]
+    base_rescue, loo_recall, threshold = max(records, key=lambda record: record[2])
+    return {
+        'threshold': threshold,
+        'base_rescue_rate': base_rescue,
+        'loo_novel_recall': loo_recall,
+    }
+
+
+def _base_protection_calibration(args, model, session, test_class):
+    """Calibrate a one-sided base rescue without evaluation labels."""
+    if int(session) <= 0:
+        return None
+    base_end = int(args.num_base)
+    active_ids = list(range(base_end, int(test_class)))
+    missing = [class_id for class_id in active_ids
+               if class_id not in _NOVEL_SUPPORT_BANK]
+    if missing:
+        raise RuntimeError(f'base protection is missing support banks for classes {missing}')
+    banks = []
+    for class_id in active_ids:
+        bank = _NOVEL_SUPPORT_BANK[class_id].detach()
+        if bank.ndim != 2 or int(bank.shape[0]) != 5:
+            raise RuntimeError(
+                f'base protection requires exactly five supports for class {class_id}; '
+                f'got {tuple(bank.shape)}')
+        banks.append(bank)
+
+    base_prototypes = model.fc.weight[:base_end].detach()
+    geometry = _load_base_protection_geometry(args, int(base_prototypes.shape[1]))
+    digest = hashlib.sha256()
+    for tensor in (base_prototypes, *banks):
+        value = tensor.detach().float().cpu().contiguous()
+        digest.update(str(tuple(value.shape)).encode('ascii'))
+        digest.update(value.numpy().tobytes())
+    recall_floor = float(getattr(args, 'incremental_base_protection_loo_recall', 0.95))
+    cache_key = (geometry['cache_key'], int(session), int(test_class), recall_floor,
+                 str(base_prototypes.device), digest.hexdigest())
+    cached = _BASE_PROTECTION_CALIBRATION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    base_unit, references = _base_conformity_reference(
+        base_prototypes, geometry['class_features'])
+    chunk_size = int(getattr(args, 'incremental_base_protection_chunk_size', 2048))
+    base_scores = []
+    for pool_cpu in geometry['class_features']:
+        for start in range(0, int(pool_cpu.shape[0]), chunk_size):
+            query = pool_cpu[start:start + chunk_size].to(base_unit.device, non_blocking=True)
+            score, _, _ = _base_conformity_scores(query, base_unit, references)
+            base_scores.append(score.cpu())
+    base_scores = torch.cat(base_scores)
+
+    # Each support is treated once as a held-out novel observation.  Its other
+    # four supports form an explicit LOO prototype for the audit diagnostic.
+    # The rescue score itself uses only base evidence, so it has no self-score.
+    heldout_supports, loo_consistency = _leave_one_out_support_observations(
+        [bank.to(base_unit.device) for bank in banks])
+    loo_scores, _, _ = _base_conformity_scores(
+        heldout_supports, base_unit, references)
+    selected = _select_base_protection_threshold(
+        base_scores, loo_scores, recall_floor)
+    cached = {
+        **selected,
+        'base_unit': base_unit,
+        'references': references,
+        'base_examples': int(base_scores.numel()),
+        'loo_examples': int(loo_scores.numel()),
+        'loo_consistency_mean': float(loo_consistency.mean()),
+    }
+    _BASE_PROTECTION_CALIBRATION_CACHE[cache_key] = cached
+    print(
+        f'[BASE-PROTECT-CAL] session={session} score=base_conformity_percentile '
+        f'threshold={cached["threshold"]:.8f} base_val={cached["base_examples"]} '
+        f'loo_novel={cached["loo_examples"]} '
+        f'base_val_rescue_ceiling={cached["base_rescue_rate"]:.6f} '
+        f'loo_recall={cached["loo_novel_recall"]:.6f} min_loo_recall={recall_floor:.6f} '
+        f'loo_consistency_mean={cached["loo_consistency_mean"]:.6f}')
+    return cached
+
+
 def test(args, model, testloader,  session):
     test_class = args.num_base + session * args.way
     model = model.eval()
-    num_batch=0
-    va=0.0
+    total_correct = 0
+    total_examples = 0
+    protection_anchor_novel = 0
+    protection_rescued = 0
+    protection = None
+    if bool(getattr(args, 'incremental_base_protection', False)) and int(session) > 0:
+        protection = _base_protection_calibration(args, model, session, test_class)
     sup_emb, novel_ids = None, None
     if (getattr(args, 'incremental_sinkhorn_balance', False) and session > 0 and
             int(session) not in _SINKHORN_CLASS_BIASES):
@@ -1332,11 +1787,30 @@ def test(args, model, testloader,  session):
         _INCREMENTAL_OSR_GATE_THRESHOLDS[int(session)] = _adaptive_margin_threshold(all_gate_margins)
         print(f'[INC-OSR-GATE] session={session} samples={len(all_gate_margins)} '
               f'threshold={_INCREMENTAL_OSR_GATE_THRESHOLDS[int(session)]:.6f}')
+    cache_enabled = (bool(getattr(args, 'cache_eval_features', True)) and
+                     not bool(getattr(args, 'incremental_osr_group_gate', False)))
+    dataset_targets = getattr(testloader.dataset, 'targets', None)
+    cache_key = None
+    cached_batches = None
+    if cache_enabled and dataset_targets is not None and len(dataset_targets) > 0:
+        cache_key = (id(model), str(args.dataset), int(session),
+                     _eval_dataset_fingerprint(testloader.dataset))
+        cached_batches = _EVAL_FEATURE_CACHE.get(cache_key)
+    batches_to_cache = [] if cache_key is not None and cached_batches is None else None
+    main_iterator = cached_batches if cached_batches is not None else testloader
     with torch.no_grad():
-        for i, batch in enumerate(testloader, 1):
-            data, test_label = [_.cuda() for _ in batch]
-            model.mode = 'incre'
-            query = model.encode(data)  # [B, 512] — consistent with prototype generation
+        for i, batch in enumerate(main_iterator, 1):
+            if cached_batches is not None:
+                query_cpu, label_cpu = batch
+                query = query_cpu.cuda(non_blocking=True)
+                test_label = label_cpu.cuda(non_blocking=True)
+                data = None
+            else:
+                data, test_label = [_.cuda() for _ in batch]
+                model.mode = 'incre'
+                query = model.encode(data)  # [B, 512] — consistent with prototype generation
+                if batches_to_cache is not None:
+                    batches_to_cache.append((query.detach().cpu(), test_label.detach().cpu()))
             # print(f"Original query shape: {query.shape}")
             proto = model.fc.weight[:test_class, :].detach()
             if getattr(args, 'feature_centering', False):
@@ -1367,6 +1841,11 @@ def test(args, model, testloader,  session):
                 logits = (-torch.cdist(query, proto).pow(2) if metric == 'euclidean'
                           else query @ proto.t() if metric == 'dot'
                           else F.cosine_similarity(query.unsqueeze(1), proto, dim=-1))
+            # Preserve the uncalibrated mean-prototype cosine scores used by the
+            # held-out validation protocol.  Novel support-bank aggregation may
+            # still improve within-novel classification, but cannot move the
+            # frozen base/novel decision boundary.
+            margin_gate_logits = logits.detach().clone()
             if getattr(args, 'novel_bank_classifier', False) and not getattr(args, 'use_pan_incremental', False):
                 for cls_id, bank in _NOVEL_SUPPORT_BANK.items():
                     if args.num_base <= cls_id < test_class and bank.numel() > 0:
@@ -1444,6 +1923,36 @@ def test(args, model, testloader,  session):
                 elif hubness_scope == 'novel':
                     hubness_mask[:int(args.num_base)] = 0.0
                 logits = logits - hubness_weight * hubness.unsqueeze(0) * hubness_mask.unsqueeze(0)
+            if protection is not None and logits.size(1) > int(args.num_base):
+                base_end = int(args.num_base)
+                # The anchor is the final calibrated classifier before any hard
+                # router.  Protection is strictly one-sided: base anchors and
+                # within-group scores are never modified.
+                anchor_novel = logits.argmax(dim=1) >= base_end
+                candidate_rows = anchor_novel.nonzero(as_tuple=False).flatten()
+                protection_anchor_novel += int(candidate_rows.numel())
+                if candidate_rows.numel() > 0:
+                    conformity, _, _ = _base_conformity_scores(
+                        query[candidate_rows], protection['base_unit'], protection['references'])
+                    rescued = conformity >= float(protection['threshold'])
+                    rescued_rows = candidate_rows[rescued]
+                    protection_rescued += int(rescued_rows.numel())
+                    logits[rescued_rows, base_end:] = -float('inf')
+            margin_gate_path = str(getattr(args, 'incremental_margin_gate_path', '') or '')
+            if margin_gate_path and logits.size(1) > int(args.num_base):
+                if metric != 'cosine':
+                    raise ValueError('incremental_margin_gate_path requires cosine evaluation')
+                if margin_gate_path not in _MARGIN_GATE_CACHE:
+                    _MARGIN_GATE_CACHE[margin_gate_path] = torch.load(
+                        margin_gate_path, map_location='cpu', weights_only=True)
+                margin_gate = _MARGIN_GATE_CACHE[margin_gate_path]
+                base_end = int(args.num_base)
+                base_max = margin_gate_logits[:, :base_end].max(dim=1).values
+                novel_max = margin_gate_logits[:, base_end:].max(dim=1).values
+                threshold = float(margin_gate['margin_threshold'])
+                choose_novel = (novel_max - base_max) >= threshold
+                logits[choose_novel, :base_end] = -float('inf')
+                logits[~choose_novel, base_end:] = -float('inf')
             router_path = str(getattr(args, 'incremental_group_router_path', ''))
             if router_path and logits.size(1) > int(args.num_base):
                 router = torch.load(router_path, map_location=logits.device, weights_only=True)
@@ -1560,10 +2069,18 @@ def test(args, model, testloader,  session):
                                         base_indices[:, 0])
                 routed[rows, predicted] = logits[rows, predicted]
                 logits = routed
-            acc = count_acc(logits, test_label)
-            num_batch+=1
-            va+=acc
-    return float(va/num_batch)
+            total_correct += int((logits.argmax(dim=1) == test_label).sum().item())
+            total_examples += int(test_label.numel())
+    if cache_key is not None and cached_batches is None:
+        _EVAL_FEATURE_CACHE[cache_key] = batches_to_cache
+        print(f'[EVAL-CACHE] stored dataset={args.dataset} session={session} '
+              f'fingerprint={cache_key[-1][:12]} batches={len(batches_to_cache)}')
+    if protection is not None:
+        rescue_rate = protection_rescued / max(protection_anchor_novel, 1)
+        print(f'[BASE-PROTECT-EVAL] session={session} samples={total_examples} '
+              f'anchor_novel={protection_anchor_novel} rescued_to_base={protection_rescued} '
+              f'anchor_novel_rescue_rate={rescue_rate:.6f}')
+    return float(total_correct / max(total_examples, 1))
 
 #baseline
 def known_test(args, model, data, label):
@@ -1730,6 +2247,12 @@ def train(args: dict):
             after = (fn @ fn.t())[~_torch.eye(_nb, dtype=_torch.bool, device=fn.device)].mean().item()
             print(f'[v8] orth_base_proto strength={_s:.2f}  base pairwise cos: {before:.4f} -> {after:.4f}')
 
+    # Embeddings are reusable only while this exact encoder is frozen.  ``train``
+    # may be called more than once by tests or experiment drivers in one Python
+    # process, so never inherit feature or artifact objects from an earlier run.
+    _EVAL_FEATURE_CACHE.clear()
+    _MARGIN_GATE_CACHE.clear()
+
     # Task 1.1: 结果输出按 opt_version 隔离，避免互相覆盖
     opt_dir = os.path.join(args.save_result, getattr(args, 'opt_version', 'opt_v5'))
     os.makedirs(opt_dir, exist_ok=True)
@@ -1744,6 +2267,8 @@ def train(args: dict):
         session_ka = [[] for _ in range(args.test_times)]
         session_uka = [[] for _ in range(args.test_times)]
         session_auroc_vals = [[] for _ in range(args.test_times)]
+        session_aupr_vals = [[] for _ in range(args.test_times)]
+        session_fpr95_vals = [[] for _ in range(args.test_times)]
         session_f1s = [[] for _ in range(args.test_times)]
         session_inc = [[] for _ in range(args.test_times)]
         session_all = [[] for _ in range(args.test_times)]
@@ -1751,6 +2276,8 @@ def train(args: dict):
             result['sess{}_ak'.format(j)]=[]
             result['sess{}_au'.format(j)]=[]
             result['sess{}_ar'.format(j)]=[]
+            result['sess{}_ap'.format(j)]=[]
+            result['sess{}_fpr95'.format(j)]=[]
             result['sess{}_fs'.format(j)]=[]
             result['sess{}_inc'.format(j)]=[]
             result['sess{}_all'.format(j)]=[]
@@ -1795,15 +2322,21 @@ def train(args: dict):
                 print(f'[STAT-MEM] reliability gate disabled replay: base_acc={base_acc:.4f} '
                       f'< {float(getattr(args, "stat_min_base_acc", 0.7)):.4f}')
             session0_acc_list.append(base_acc)
-            # 记录结果（未知类指标设为0）
+            # Session 0 has neither incremental nor unknown classes.  Mark
+            # those metrics undefined instead of reporting a misleading zero.
+            session0_undefined = float('nan')
             result['sess0_ak'].append(base_acc)
             result['sess0_au'].append(0.0)
-            result['sess0_fs'].append(0.0)
-            result['sess0_inc'].append(0.0)
+            result['sess0_ar'].append(session0_undefined)
+            result['sess0_ap'].append(session0_undefined)
+            result['sess0_fpr95'].append(session0_undefined)
+            result['sess0_fs'].append(session0_undefined)
+            result['sess0_inc'].append(session0_undefined)
             result['sess0_all'].append(base_acc)
             # 打印session 0结果
-            print(f"Session 0: acc known: {base_acc:.4f}, acc unknown: 0.0000, "
-                  f"f1 score: 0.0000, inc acc:0.0000, all acc: {base_acc:.4f}")
+            print(f"Session 0: acc known: {base_acc:.4f}, acc unknown: N/A, "
+                  f"auroc: N/A, aupr: N/A, fpr95: N/A, f1 score: N/A, "
+                  f"inc acc: N/A, all acc: {base_acc:.4f}")
             for session in range(args.start_session, args.num_session):  
                 print("Inference session: [%d]" % session)
                 print(f"test_time: {i}")
@@ -1818,12 +2351,25 @@ def train(args: dict):
                 session_batches = list(unlabelled_loader)
                 _encode_current_session_supports(args, model, session_batches, session)
                 #OSR_DETECTION
+                # These compatibility side channels are process-global.  Clear
+                # them before, not only after, each call so a prior interrupted
+                # evaluation can never contaminate the current session.
+                run_test_fsl._auroc_list = []
+                run_test_fsl._osr_metrics_list = []
                 unknow_data,unknow_label,know_data,know_label=run_test_fsl(
                     model, args, session_batches, session=session)
-                # Extract per-session AUROC from function attribute
+                # Extract the threshold-free metrics from the same session-level
+                # score vector.  threshold_free computes all three already; the
+                # old reporting path silently discarded AUPR and FPR95.
                 auroc_list = getattr(run_test_fsl, '_auroc_list', [])
-                session_auroc = float(np.mean(auroc_list)) if auroc_list else 0.0
-                run_test_fsl._auroc_list = []  # reset for next session
+                osr_metrics_list = getattr(run_test_fsl, '_osr_metrics_list', [])
+                osr_metrics = osr_metrics_list[-1] if osr_metrics_list else {}
+                session_auroc = float(osr_metrics.get(
+                    'auroc', np.mean(auroc_list) if auroc_list else float('nan')))
+                session_aupr = float(osr_metrics.get('aupr', float('nan')))
+                session_fpr95 = float(osr_metrics.get('fpr95', float('nan')))
+                run_test_fsl._auroc_list = []
+                run_test_fsl._osr_metrics_list = []
 
                 # ===== OSR 诊断: 分离 known/unknown 判决准确率 =====
                 _nl = args.num_labeled_classes
@@ -2035,6 +2581,8 @@ def train(args: dict):
                 result['sess{}_ak'.format(session)]+=[acc_known]
                 result['sess{}_au'.format(session)]+=[cluster_acc]
                 result['sess{}_ar'.format(session)]+=[session_auroc]
+                result['sess{}_ap'.format(session)]+=[session_aupr]
+                result['sess{}_fpr95'.format(session)]+=[session_fpr95]
                 result['sess{}_fs'.format(session)]+=[fscore]
                 #incremental learning
                 _,testloader = get_testloader(args,session)
@@ -2056,6 +2604,8 @@ def train(args: dict):
                 session_ka[i].append(acc_known)
                 session_uka[i].append(cluster_acc)
                 session_auroc_vals[i].append(session_auroc)
+                session_aupr_vals[i].append(session_aupr)
+                session_fpr95_vals[i].append(session_fpr95)
                 session_f1s[i].append(fscore)
                 session_inc[i].append(inc_acc)
                 session_all[i].append(all_acc)
@@ -2063,8 +2613,11 @@ def train(args: dict):
                 # print(f"\n=== Final Average Session 0 Acc: {avg_session0_acc:.4f} ===")
                 # result_file.write(f"\nAverage Session 0 Acc: {avg_session0_acc:.4f}\n")
                 # 写入文件  
-                result_line = "[RAW] round={} session={} acc known={:.6f} acc unknown={:.6f} auroc={:.6f} f1={:.6f} inc={:.6f} all={:.6f}\n".format(
-                    i, session, acc_known, cluster_acc, session_auroc, fscore, inc_acc, all_acc)
+                result_line = ("[RAW] round={} session={} acc known={:.6f} acc unknown={:.6f} "
+                               "auroc={:.6f} aupr={:.6f} fpr95={:.6f} f1={:.6f} "
+                               "inc={:.6f} all={:.6f}\n").format(
+                    i, session, acc_known, cluster_acc, session_auroc, session_aupr,
+                    session_fpr95, fscore, inc_acc, all_acc)
                 result_file.write(result_line)  
                 print(result_line.strip())
             best_model_dir = os.path.join(args.save_dir, 'session' + str(session) + '_max_acc.pth')
@@ -2080,6 +2633,8 @@ def train(args: dict):
         session_ka_means = []  # 存储每个session的 known_acc 均值
         session_uka_means = [] # 存储每个session的 unknown_acc 均值
         session_ar_means = []  # 存储每个session的 auroc 均值
+        session_ap_means = []  # per-session AUPR mean
+        session_fpr95_means = []  # per-session FPR at 95% TPR mean
         session_f1s_means = [] # 存储每个session的 f1_score 均值
         session_inc_means = [] # 存储每个session的 incremental_acc 均值
         session_all_means = [] # 存储每个session的 incremental_acc 均值
@@ -2088,6 +2643,8 @@ def train(args: dict):
             ka_values = [session_ka[time][ses] for time in range(args.test_times)]
             uka_values = [session_uka[time][ses] for time in range(args.test_times)]
             ar_values = [session_auroc_vals[time][ses] for time in range(args.test_times)]
+            ap_values = [session_aupr_vals[time][ses] for time in range(args.test_times)]
+            fpr95_values = [session_fpr95_vals[time][ses] for time in range(args.test_times)]
             f1s_values = [session_f1s[time][ses] for time in range(args.test_times)]
             inc_values = [session_inc[time][ses] for time in range(args.test_times)]
             all_values = [session_all[time][ses] for time in range(args.test_times)]
@@ -2097,6 +2654,10 @@ def train(args: dict):
             uka_std = np.std(uka_values, ddof=1) if len(uka_values) > 1 else 0.0
             ar_mean = np.mean(ar_values)
             ar_std = np.std(ar_values, ddof=1) if len(ar_values) > 1 else 0.0
+            ap_mean = np.mean(ap_values)
+            ap_std = np.std(ap_values, ddof=1) if len(ap_values) > 1 else 0.0
+            fpr95_mean = np.mean(fpr95_values)
+            fpr95_std = np.std(fpr95_values, ddof=1) if len(fpr95_values) > 1 else 0.0
             f1s_mean = np.mean(f1s_values)
             f1s_std = np.std(f1s_values, ddof=1) if len(f1s_values) > 1 else 0.0
             inc_mean = np.mean(inc_values)
@@ -2106,6 +2667,8 @@ def train(args: dict):
             session_ka_means.append(ka_mean)
             session_uka_means.append(uka_mean)
             session_ar_means.append(ar_mean)
+            session_ap_means.append(ap_mean)
+            session_fpr95_means.append(fpr95_mean)
             session_f1s_means.append(f1s_mean)
             session_inc_means.append(inc_mean)
             session_all_means.append(all_mean)
@@ -2113,6 +2676,8 @@ def train(args: dict):
             print(f"total session{ses+1} acc known is {ka_mean:.4f} ± {ka_std:.4f}")
             print(f"total session{ses+1} acc unknown is {uka_mean:.4f} ± {uka_std:.4f}")
             print(f"total session{ses+1} auroc is {ar_mean:.4f} ± {ar_std:.4f}")
+            print(f"total session{ses+1} aupr is {ap_mean:.4f} ± {ap_std:.4f}")
+            print(f"total session{ses+1} fpr95 is {fpr95_mean:.4f} ± {fpr95_std:.4f}")
             print(f"total session{ses+1} f1 score is {f1s_mean:.4f} ± {f1s_std:.4f}")
             print(f"total session{ses+1} incremental acc is {inc_mean:.4f} ± {inc_std:.4f}")
             print(f"total session{ses+1} all acc is {all_mean:.4f} ± {all_std:.4f}")
@@ -2122,6 +2687,8 @@ def train(args: dict):
                 f"total aac known: {ka_mean:.4f} ± {ka_std:.4f}, "
                 f"total acc unknown: {uka_mean:.4f} ± {uka_std:.4f}, "
                 f"total auroc: {ar_mean:.4f} ± {ar_std:.4f}, "
+                f"total aupr: {ap_mean:.4f} ± {ap_std:.4f}, "
+                f"total fpr95: {fpr95_mean:.4f} ± {fpr95_std:.4f}, "
                 f"total f1 score: {f1s_mean:.4f} ± {f1s_std:.4f}, "
                 f"total incremental acc: {inc_mean:.4f} ± {inc_std:.4f}, "
                 f"total all acc: {all_mean:.4f} ± {all_std:.4f}\n"
@@ -2130,6 +2697,8 @@ def train(args: dict):
         aa_known = round(np.mean(session_ka_means), 4)
         aa_unknown = round(np.mean(session_uka_means), 4)
         aa_auroc = round(np.mean(session_ar_means), 4)
+        aa_aupr = round(np.mean(session_ap_means), 4)
+        aa_fpr95 = round(np.mean(session_fpr95_means), 4)
         aa_f1 = round(np.mean(session_f1s_means), 4)
         aa_inc = round(np.mean(session_inc_means), 4)
         aa_all = round(np.mean(session_all_means), 4)
@@ -2137,6 +2706,8 @@ def train(args: dict):
         print(f"Average Acc Known:    {aa_known:.4f}")
         print(f"Average Acc Unknown:  {aa_unknown:.4f}")
         print(f"Average AUROC:        {aa_auroc:.4f}")
+        print(f"Average AUPR:         {aa_aupr:.4f}")
+        print(f"Average FPR95:        {aa_fpr95:.4f}")
         print(f"Average F1 Score:     {aa_f1:.4f}")
         print(f"Average Incremental Acc: {aa_inc:.4f}")
         print(f"Average all Acc: {aa_all:.4f}")
@@ -2144,6 +2715,8 @@ def train(args: dict):
         result_file.write(f"Average Acc Known:    {aa_known:.4f}\n")
         result_file.write(f"Average Acc Unknown:  {aa_unknown:.4f}\n")
         result_file.write(f"Average AUROC:        {aa_auroc:.4f}\n")
+        result_file.write(f"Average AUPR:         {aa_aupr:.4f}\n")
+        result_file.write(f"Average FPR95:        {aa_fpr95:.4f}\n")
         result_file.write(f"Average F1 Score:     {aa_f1:.4f}\n")
         result_file.write(f"Average Incremental Acc: {aa_inc:.4f}\n")
         result_file.write(f"Average all Acc: {aa_all:.4f}\n")

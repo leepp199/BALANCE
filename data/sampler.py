@@ -96,11 +96,13 @@ class TrueIncreTrainCategoriesSampler():
 
 class SupportsetSampler():
 
-    def __init__(self, label, n_cls, n_per,  n_batch=1, seq_sample=False):
+    def __init__(self, label, n_cls, n_per, n_batch=1, seq_sample=False,
+                 generator=None):
         self.n_batch = n_batch  # the number of iterations in the dataloader
         self.n_cls = n_cls
         self.n_per = n_per
         self.seq_sample = seq_sample
+        self.generator = generator
         label = np.array(label)  # all data label
         self.m_ind = []  # the data index of each class
         for i in range(min(label), max(label) + 1):
@@ -125,13 +127,15 @@ class SupportsetSampler():
             if self.seq_sample:
                 classes =  list(range(len(self.m_ind)))[:self.n_cls]
             else:
-                classes = torch.randperm(len(self.m_ind))[:self.n_cls]  # random sample num_class indexs,e.g. 5
+                classes = torch.randperm(
+                    len(self.m_ind), generator=self.generator)[:self.n_cls]
             for c in classes:
                 l = self.m_ind[c]  # all data indexs of this class
                 if self.seq_sample:
                     pos = list(range(len(l)))[:self.n_per]
                 else:
-                    pos = torch.randperm(len(l))[:self.n_per]  # sample n_per data index of this class
+                    pos = torch.randperm(
+                        len(l), generator=self.generator)[:self.n_per]
                 batch.append(l[pos])
             batch = torch.stack(batch).t().reshape(-1)
             # .t() transpose,

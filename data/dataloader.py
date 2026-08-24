@@ -10,6 +10,24 @@ def seed_worker(worker_id):
 # 2. 创建生成器
 g = torch.Generator()
 g.manual_seed(0) # 或者传入 args.seed
+
+
+def _incremental_episode_seed(args, session):
+    """Seed one support/stream episode independently of unrelated RNG calls."""
+    return (int(args.seed) +
+            1009 * int(getattr(args, 'current_test', 0)) +
+            int(session))
+
+
+def _episode_generators(episode_seed):
+    sampler_generator = torch.Generator()
+    sampler_generator.manual_seed(int(episode_seed))
+    worker_generator = torch.Generator()
+    # Keep DataLoader worker seed consumption separate from support selection.
+    worker_generator.manual_seed(int(episode_seed) + 1_000_003)
+    return sampler_generator, worker_generator
+
+
 def get_test_dataloader(args):
     class_new = np.arange(args.num_base,100)
     testset = args.Dataset.Openlbrs(root=args.dataroot,index=class_new,args=args,partition='test', fix_seed=True)
@@ -57,7 +75,8 @@ def get_mixed_openworld_dataloader(args, session):
     """Balanced stream episode: 5 previously seen classes + 5 current novel classes."""
     assert session > 0
     seen_end = args.num_base + (session - 1) * args.way
-    rng = np.random.RandomState(int(args.seed) + 1009 * int(getattr(args, 'current_test', 0)) + session)
+    episode_seed = _incremental_episode_seed(args, session)
+    rng = np.random.RandomState(episode_seed)
     known_classes = np.sort(rng.choice(np.arange(seen_end), size=args.way, replace=False))
     novel_classes = np.arange(args.num_base + (session - 1) * args.way,
                               args.num_base + session * args.way)
@@ -74,11 +93,17 @@ def get_mixed_openworld_dataloader(args, session):
     else:
         trainset = args.Dataset.S2S(dataset=args.dataset, root=args.dataroot, phase='train',
                                     index=stream_classes, k=None, args=args)
+    sampler_generator, worker_generator = _episode_generators(episode_seed)
     sampler = SupportsetSampler(label=trainset.targets, n_cls=2 * args.way,
-                                n_per=args.n_shots, n_batch=1, seq_sample=args.seq_sample)
+                                n_per=args.n_shots, n_batch=1,
+                                seq_sample=args.seq_sample,
+                                generator=sampler_generator)
     loader = torch.utils.data.DataLoader(dataset=trainset, batch_sampler=sampler,
                                          num_workers=args.dataloader.num_workers, pin_memory=True,
-                                         worker_init_fn=seed_worker, generator=g)
+                                         worker_init_fn=seed_worker,
+                                         generator=worker_generator)
+    print(f'[EPISODE-SEED] round={int(getattr(args, "current_test", 0))} '
+          f'session={int(session)} seed={episode_seed} mixed=True')
     return trainset, loader
     
 
@@ -237,7 +262,8 @@ def get_new_dataloader(args, session):
     assert session > 0
     if args.dataset == 'FMC':
         session_classes = np.arange(num_base_class + (session -1) * args.way, num_base_class + session * args.way)
-        trainset = args.Dataset.FSDCLIPS(root=args.dataroot, phase='train', index=session_classes, k=None,args=args)
+        trainset = args.Dataset.FSDCLIPS(root=args.dataroot, phase='train', index=session_classes,
+                                        k=None, base_sess=True, args=args)
     elif 'nsynth' in args.dataset:
         session_classes = np.arange(num_base_class + (session -1) * args.way, num_base_class + session * args.way)
         trainset = args.Dataset.NDS(root=args.dataroot, phase='train', index=session_classes, k=None, args=args)
@@ -247,12 +273,18 @@ def get_new_dataloader(args, session):
     elif args.dataset in ['f2n', 'f2l', 'n2f', 'n2l', 'l2f', 'l2n']:
         session_classes = np.arange(num_base_class + (session -1) * args.way, num_base_class + session * args.way)
         trainset = args.Dataset.S2S(dataset=args.dataset, root=args.dataroot, phase='train', index=session_classes, k=None, args=args)
+    episode_seed = _incremental_episode_seed(args, session)
+    sampler_generator, worker_generator = _episode_generators(episode_seed)
     train_sampler = SupportsetSampler(label=trainset.targets, n_cls=args.way,
-                                n_per=args.n_shots, n_batch=1, seq_sample=args.seq_sample)
+                                n_per=args.n_shots, n_batch=1,
+                                seq_sample=args.seq_sample,
+                                generator=sampler_generator)
 
     trainloader = torch.utils.data.DataLoader(dataset=trainset, batch_sampler=train_sampler, num_workers=args.dataloader.num_workers,
                                                 pin_memory=True,worker_init_fn=seed_worker,  # <--- 新增
-        generator=g)
+        generator=worker_generator)
+    print(f'[EPISODE-SEED] round={int(getattr(args, "current_test", 0))} '
+          f'session={int(session)} seed={episode_seed} mixed=False')
                                                 
    
     return trainset, trainloader

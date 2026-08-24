@@ -11,14 +11,17 @@ if [[ "$protocol" != "ls100" && "$protocol" != "ns100" && "$protocol" != "fsc89"
   exit 2
 fi
 
-python_bin="${FOWAC_PYTHON:-python}"
-repeats="${FOWAC_REPEATS:-50}"
+python_bin="${BALANCE_PYTHON:-python}"
+repeats="${BALANCE_REPEATS:-50}"
 metadata_args=()
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export WANDB_MODE=offline
 export WANDB_DISABLED=true
 export TORCH_HOME="${TORCH_HOME:-${project_root}/.offline_torch}"
+export NUMBA_CACHE_DIR="${NUMBA_CACHE_DIR:-${project_root}/.offline_cache/numba}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-${project_root}/.offline_cache/matplotlib}"
+mkdir -p "$NUMBA_CACHE_DIR" "$MPLCONFIGDIR"
 
 require_asset() {
   local value="$1"
@@ -29,8 +32,8 @@ require_asset() {
 
 case "$protocol" in
   ls100)
-    data_root="${FOWAC_LS100_DATA:-}"
-    checkpoint="${FOWAC_LS100_CHECKPOINT:-}"
+    data_root="${BALANCE_LS100_DATA:-}"
+    checkpoint="${BALANCE_LS100_CHECKPOINT:-}"
     config="configs/exp_ls100.yml"
     dataset="librispeech"
     extra_args=(
@@ -41,13 +44,14 @@ case "$protocol" in
     )
     ;;
   ns100)
-    data_root="${FOWAC_NS100_DATA:-}"
-    checkpoint="${FOWAC_NS100_CHECKPOINT:-}"
+    data_root="${BALANCE_NS100_DATA:-}"
+    checkpoint="${BALANCE_NS100_CHECKPOINT:-}"
     config="configs/exp_ns100.yml"
     dataset="nsynth-100"
-    if [[ -n "${FOWAC_NS100_METADATA:-}" ]]; then
-      require_asset "$FOWAC_NS100_METADATA" FOWAC_NS100_METADATA
-      metadata_args=(--ns100_metadata_root "$FOWAC_NS100_METADATA")
+    ns100_metadata="${BALANCE_NS100_METADATA:-}"
+    if [[ -n "$ns100_metadata" ]]; then
+      require_asset "$ns100_metadata" BALANCE_NS100_METADATA
+      metadata_args=(--ns100_metadata_root "$ns100_metadata")
     fi
     extra_args=(
       --cluster_all_candidates True
@@ -55,12 +59,12 @@ case "$protocol" in
     )
     ;;
   fsc89)
-    data_root="${FOWAC_FSC89_DATA:-}"
-    checkpoint="${FOWAC_FSC89_CHECKPOINT:-}"
-    geometry="${FOWAC_FSC89_GEOMETRY:-}"
-    metadata="${FOWAC_FSC89_METADATA:-}"
-    require_asset "$geometry" FOWAC_FSC89_GEOMETRY
-    require_asset "$metadata" FOWAC_FSC89_METADATA
+    data_root="${BALANCE_FSC89_DATA:-}"
+    checkpoint="${BALANCE_FSC89_CHECKPOINT:-}"
+    geometry="${BALANCE_FSC89_GEOMETRY:-}"
+    metadata="${BALANCE_FSC89_METADATA:-}"
+    require_asset "$geometry" BALANCE_FSC89_GEOMETRY
+    require_asset "$metadata" BALANCE_FSC89_METADATA
     config="configs/exp_fsc89.yml"
     dataset="FMC"
     extra_args=(
@@ -82,11 +86,12 @@ require_asset "$data_root" "${protocol} data"
 require_asset "$checkpoint" "${protocol} checkpoint"
 
 structure_args=()
-if [[ -n "${FOWAC_LSRB_CHECKPOINT:-}" ]]; then
-  require_asset "$FOWAC_LSRB_CHECKPOINT" FOWAC_LSRB_CHECKPOINT
+lsrb_checkpoint="${BALANCE_LSRB_CHECKPOINT:-}"
+if [[ -n "$lsrb_checkpoint" ]]; then
+  require_asset "$lsrb_checkpoint" BALANCE_LSRB_CHECKPOINT
   structure_args=(
-    --structure_discovery_checkpoint "$FOWAC_LSRB_CHECKPOINT"
-    --structure_discovery_weight "${FOWAC_LSRB_WEIGHT:-0.5}"
+    --structure_discovery_checkpoint "$lsrb_checkpoint"
+    --structure_discovery_weight "${BALANCE_LSRB_WEIGHT:-0.5}"
   )
 fi
 

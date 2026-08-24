@@ -5,8 +5,8 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_root="$(cd -- "${script_dir}/.." && pwd)"
 cd "$project_root"
 
-python_bin="${FOWAC_PYTHON:-python}"
-require_assets="${FOWAC_REQUIRE_ASSETS:-0}"
+python_bin="${BALANCE_PYTHON:-python}"
+require_assets="${BALANCE_REQUIRE_ASSETS:-0}"
 
 fail() {
   echo "OFFLINE PREFLIGHT FAILED: $*" >&2
@@ -25,7 +25,7 @@ check_optional_dir() {
     [[ -d "$value" ]] || fail "$label directory does not exist: $value"
     echo "asset ok: $label=$value"
   elif [[ "$require_assets" == "1" ]]; then
-    fail "$variable_name is required when FOWAC_REQUIRE_ASSETS=1"
+    fail "$variable_name is required when BALANCE_REQUIRE_ASSETS=1"
   else
     echo "asset skipped: $variable_name is not set"
   fi
@@ -40,7 +40,7 @@ check_optional_file() {
     [[ -s "$value" ]] || fail "$label file does not exist or is empty: $value"
     echo "asset ok: $label=$value"
   elif [[ "$require_assets" == "1" && "$required_when_strict" == "1" ]]; then
-    fail "$variable_name is required when FOWAC_REQUIRE_ASSETS=1"
+    fail "$variable_name is required when BALANCE_REQUIRE_ASSETS=1"
   else
     echo "asset skipped: $variable_name is not set"
   fi
@@ -52,7 +52,7 @@ export TRANSFORMERS_OFFLINE=1
 export WANDB_MODE=offline
 export WANDB_DISABLED=true
 export TORCH_HOME="${TORCH_HOME:-${project_root}/.offline_torch}"
-export MPLCONFIGDIR="${MPLCONFIGDIR:-${TMPDIR:-/tmp}/fowac-matplotlib}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-${TMPDIR:-/tmp}/balance-matplotlib}"
 mkdir -p "$MPLCONFIGDIR"
 
 core_files=(
@@ -66,7 +66,7 @@ core_files=(
   models/lsrb.py
   models/resnet18_encoder.py
   models/uncertainty.py
-  scripts/run_fowac.sh
+  scripts/run_balance.sh
   configs/exp_ls100.yml
   configs/exp_ns100.yml
   configs/exp_fsc89.yml
@@ -75,7 +75,7 @@ for path in "${core_files[@]}"; do
   require_file "$path"
 done
 
-bash -n scripts/run_fowac.sh
+bash -n scripts/run_balance.sh
 
 # Fail if the primary network constructor is changed back to implicit downloads.
 if command -v rg >/dev/null 2>&1; then
@@ -143,16 +143,16 @@ for name in modules:
     print(f"import ok: {name}")
 PY
 
-check_optional_dir FOWAC_LS100_DATA "LS-100 data"
-check_optional_dir FOWAC_NS100_DATA "NS-100 data"
-check_optional_dir FOWAC_FSC89_DATA "FSC-89 data"
-check_optional_dir FOWAC_NS100_METADATA "NS-100 metadata"
-check_optional_dir FOWAC_FSC89_METADATA "FSC-89 metadata"
-check_optional_file FOWAC_LS100_CHECKPOINT "LS-100 checkpoint"
-check_optional_file FOWAC_NS100_CHECKPOINT "NS-100 checkpoint"
-check_optional_file FOWAC_FSC89_CHECKPOINT "FSC-89 checkpoint"
-check_optional_file FOWAC_LSRB_CHECKPOINT "LSRB checkpoint"
-check_optional_file FOWAC_FSC89_GEOMETRY "FSC-89 geometry"
+check_optional_dir BALANCE_LS100_DATA "LS-100 data"
+check_optional_dir BALANCE_NS100_DATA "NS-100 data"
+check_optional_dir BALANCE_FSC89_DATA "FSC-89 data"
+check_optional_dir BALANCE_NS100_METADATA "NS-100 metadata"
+check_optional_dir BALANCE_FSC89_METADATA "FSC-89 metadata"
+check_optional_file BALANCE_LS100_CHECKPOINT "LS-100 checkpoint"
+check_optional_file BALANCE_NS100_CHECKPOINT "NS-100 checkpoint"
+check_optional_file BALANCE_FSC89_CHECKPOINT "FSC-89 checkpoint"
+check_optional_file BALANCE_LSRB_CHECKPOINT "LSRB checkpoint"
+check_optional_file BALANCE_FSC89_GEOMETRY "FSC-89 geometry"
 
 echo "OFFLINE PREFLIGHT PASSED"
 echo "Source, protocol configurations, and core imports are available offline."

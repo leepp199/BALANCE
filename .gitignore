@@ -6,6 +6,7 @@ __pycache__/
 
 # Local environments and downloaded model/data caches
 .offline_torch/
+.offline_cache/
 .cache/
 .qoder/
 artifacts/
@@ -55,7 +56,8 @@ configs/*
 !configs/exp_fsc89.yml
 scripts/*
 !scripts/offline_preflight.sh
-!scripts/run_fowac.sh
+!scripts/run_balance.sh
+!scripts/calibrate_fsc89_margin.py
 tools/background_continue.sh
 models/feature_enhancer.py
 models/resnet_enhancer.py
