@@ -5,7 +5,7 @@ stream. At each incremental session, the system must retain known classes, rejec
 unfamiliar inputs, discover emerging classes, and expand the classifier from a
 small labeled support set.
 
-![BALANCE method overview](assets/balance_framework.svg)
+![BALANCE method overview](assets/balance_framework_4k.png)
 
 The implementation combines the following method components:
 
