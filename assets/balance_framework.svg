@@ -1,0 +1,154 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="780" viewBox="0 0 2400 780">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1f2937"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1769aa"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2f7d32"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#c62828"/>
+    </marker>
+    <style>
+      .phase { fill:#ffffff; stroke-width:3; rx:16; }
+      .header { stroke:none; rx:13; }
+      .htext { font:700 37px 'Times New Roman',serif; fill:#ffffff; text-anchor:middle; dominant-baseline:middle; }
+      .label { font:32px 'Times New Roman',serif; fill:#111827; text-anchor:middle; dominant-baseline:middle; }
+      .math { font:italic 32px 'Times New Roman',serif; fill:#111827; text-anchor:middle; dominant-baseline:middle; }
+      .node { fill:#ffffff; stroke:#334155; stroke-width:2.6; rx:12; }
+      .blueNode { fill:#e9f3f8; stroke:#277da1; stroke-width:2.6; rx:12; }
+      .yellowNode { fill:#fff4cf; stroke:#c58b00; stroke-width:2.6; rx:12; }
+      .greenNode { fill:#edf6df; stroke:#5b8e31; stroke-width:2.6; rx:12; }
+      .redNode { fill:#fdebec; stroke:#c62828; stroke-width:2.6; rx:12; }
+      .violetNode { fill:#f2edf7; stroke:#76538e; stroke-width:2.6; rx:12; }
+      .edge { fill:none; stroke:#1f2937; stroke-width:4; marker-end:url(#arrow); }
+      .blueEdge { fill:none; stroke:#1769aa; stroke-width:4; stroke-dasharray:14 10; marker-end:url(#arrowBlue); }
+      .greenEdge { fill:none; stroke:#2f7d32; stroke-width:4; marker-end:url(#arrowGreen); }
+      .redEdge { fill:none; stroke:#c62828; stroke-width:4; marker-end:url(#arrowRed); }
+      .group { fill:#fbfcfd; stroke:#94a3b8; stroke-width:2.4; stroke-dasharray:11 8; rx:14; }
+    </style>
+  </defs>
+
+  <!-- Phase containers -->
+  <rect class="phase" x="15" y="15" width="750" height="750" stroke="#0b70b7"/>
+  <rect class="header" x="15" y="15" width="750" height="68" fill="#0b70b7"/>
+  <text class="htext" x="390" y="50">1  Uncertainty Curriculum + LSRB</text>
+
+  <rect class="phase" x="785" y="15" width="750" height="750" stroke="#e6a500"/>
+  <rect class="header" x="785" y="15" width="750" height="68" fill="#e6a500"/>
+  <text class="htext" x="1160" y="50">2  Class-Conditional Boundary</text>
+
+  <rect class="phase" x="1555" y="15" width="830" height="750" stroke="#76538e"/>
+  <rect class="header" x="1555" y="15" width="830" height="68" fill="#76538e"/>
+  <text class="htext" x="1970" y="50">3  Online Open-World Session</text>
+
+  <!-- Phase 1 -->
+  <rect class="node" x="45" y="145" width="150" height="105"/>
+  <path d="M65 203 C75 170 85 235 95 193 S115 230 125 188 S145 222 175 197" fill="none" stroke="#111827" stroke-width="5"/>
+  <text class="label" x="120" y="120">Audio</text>
+
+  <rect class="blueNode" x="245" y="145" width="170" height="105"/>
+  <text class="label" x="330" y="198">Encoder E₀</text>
+  <path class="edge" d="M195 198 H245"/>
+
+  <rect class="group" x="465" y="105" width="270" height="205"/>
+  <rect class="yellowNode" x="500" y="130" width="200" height="68"/>
+  <text class="label" x="600" y="165">Uncertainty U(x)</text>
+  <rect class="greenNode" x="500" y="225" width="85" height="55"/>
+  <text class="label" x="542" y="253">Easy</text>
+  <rect class="redNode" x="615" y="225" width="85" height="55"/>
+  <text class="label" x="657" y="253">Hard</text>
+  <path class="edge" d="M585 253 H615"/>
+  <path class="edge" d="M415 175 H465 V165 H500"/>
+
+  <rect class="group" x="80" y="350" width="655" height="205"/>
+  <rect class="node" x="110" y="410" width="170" height="78"/>
+  <text class="label" x="195" y="449">Local Descriptors</text>
+  <rect class="blueNode" x="335" y="410" width="155" height="78"/>
+  <text class="label" x="412" y="449">Fit LSRB B</text>
+  <rect class="blueNode" x="545" y="410" width="160" height="78"/>
+  <text class="label" x="625" y="449">Masked Assign.</text>
+  <path class="edge" d="M280 449 H335"/>
+  <path class="edge" d="M490 449 H545"/>
+  <path class="edge" d="M330 250 V330 H195 V410"/>
+
+  <rect class="blueNode" x="70" y="620" width="185" height="82"/>
+  <text class="label" x="162" y="661">Frozen E₀</text>
+  <rect class="blueNode" x="290" y="620" width="185" height="82"/>
+  <text class="label" x="382" y="661">Base Prototypes</text>
+  <rect class="blueNode" x="510" y="620" width="185" height="82"/>
+  <text class="label" x="602" y="661">Frozen LSRB</text>
+  <path class="edge" d="M330 555 V585 H162 V620"/>
+  <path class="edge" d="M330 585 H382 V620"/>
+  <path class="edge" d="M625 488 V585 H602 V620"/>
+
+  <!-- Phase 2 -->
+  <rect class="group" x="815" y="110" width="690" height="135"/>
+  <rect class="yellowNode" x="840" y="140" width="175" height="72"/>
+  <text class="math" x="927" y="176">Support S</text>
+  <rect class="greenNode" x="1065" y="140" width="175" height="72"/>
+  <text class="math" x="1152" y="176">Known Qₖ</text>
+  <rect class="violetNode" x="1290" y="140" width="185" height="72"/>
+  <text class="math" x="1382" y="176">Pseudo-Unknown Qᵤ</text>
+
+  <rect class="node" x="835" y="315" width="230" height="88"/>
+  <text class="label" x="950" y="359">Positive Prototypes P⁺</text>
+  <rect class="blueNode" x="1110" y="285" width="230" height="78"/>
+  <text class="label" x="1225" y="324">Boundary Generator ψ</text>
+  <rect class="redNode" x="1110" y="405" width="230" height="88"/>
+  <text class="label" x="1225" y="449">Boundary Companions P⁻</text>
+  <path class="edge" d="M927 212 V315"/>
+  <path class="edge" d="M1382 212 V260 H1225 V285"/>
+  <path class="edge" d="M1225 363 V405"/>
+
+  <rect class="yellowNode" x="925" y="535" width="300" height="80"/>
+  <text class="label" x="1075" y="575">Boundary Margin Loss</text>
+  <path class="edge" d="M950 403 V515 H1030 V535"/>
+  <path class="edge" d="M1225 493 V515 H1120 V535"/>
+  <rect class="blueNode" x="1280" y="535" width="190" height="80"/>
+  <text class="label" x="1375" y="575">Margin Gate τ</text>
+  <path class="edge" d="M1225 575 H1280"/>
+
+  <!-- Base model feeds boundary learning -->
+  <path class="edge" d="M475 661 H760 V359 H835"/>
+
+  <!-- Phase 3 -->
+  <rect class="node" x="1590" y="130" width="205" height="82"/>
+  <path d="M1610 172 C1620 140 1630 205 1640 160 S1660 200 1670 155 S1690 195 1775 170" fill="none" stroke="#111827" stroke-width="5"/>
+  <text class="label" x="1692" y="108">Mixed Stream</text>
+  <rect class="blueNode" x="1845" y="130" width="190" height="82"/>
+  <text class="label" x="1940" y="171">Frozen E₀</text>
+  <rect class="blueNode" x="2085" y="130" width="220" height="82"/>
+  <text class="label" x="2195" y="171">Margin Gate τ</text>
+  <path class="edge" d="M1795 171 H1845"/>
+  <path class="edge" d="M2035 171 H2085"/>
+
+  <rect class="greenNode" x="1605" y="300" width="210" height="82"/>
+  <text class="label" x="1710" y="341">Known Prediction</text>
+  <path class="greenEdge" d="M2195 212 V255 H1710 V300"/>
+
+  <rect class="redNode" x="1900" y="285" width="330" height="92"/>
+  <text class="label" x="2065" y="331">Semantic + LSRB</text>
+  <path class="redEdge" d="M2195 212 V255 H2065 V285"/>
+  <rect class="yellowNode" x="1900" y="435" width="330" height="82"/>
+  <text class="math" x="2065" y="476">Standard Kₜ-means</text>
+  <path class="edge" d="M2065 377 V435"/>
+
+  <rect class="violetNode" x="1590" y="610" width="200" height="80"/>
+  <text class="label" x="1690" y="650">5-shot Supports</text>
+  <rect class="greenNode" x="1845" y="610" width="200" height="80"/>
+  <text class="label" x="1945" y="650">Mean Prototype</text>
+  <rect class="blueNode" x="2100" y="610" width="230" height="80"/>
+  <text class="label" x="2215" y="650">Expand Classifier Cₜ</text>
+  <path class="edge" d="M2065 517 V565 H1690 V610"/>
+  <path class="edge" d="M1790 650 H1845"/>
+  <path class="edge" d="M2045 650 H2100"/>
+
+  <!-- Frozen LSRB reuse: structure only in online discovery -->
+  <path class="blueEdge" d="M602 702 V742 H1515 V331 H1900"/>
+  <!-- Next-session loop -->
+  <path class="edge" d="M2215 690 V730 H1585 V212 H1590"/>
+</svg>

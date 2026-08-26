@@ -1,11 +1,11 @@
-# BALANCE: Boundary-Aware Latent-Reference Assignment for Novel-Class Expansion
+# BALANCE: Boundary-Aware Latent-Reference Alignment for Novel-Class Expansion
 
 BALANCE addresses few-shot class-incremental audio classification in an open-world
-stream. At each incremental session, the system must retain registered classes,
-reject unfamiliar inputs, discover emerging classes, and register them from a
-small support set.
+stream. At each incremental session, the system must retain known classes, reject
+unfamiliar inputs, discover emerging classes, and expand the classifier from a
+small labeled support set.
 
-![BALANCE method overview](assets/balance_framework.png)
+![BALANCE method overview](assets/balance_framework.svg)
 
 The implementation combines the following method components:
 
@@ -13,12 +13,13 @@ The implementation combines the following method components:
   structures learned during base training and reused across sessions;
 - **Margin-based Open-World Gate:** an adaptive score-margin decision that
   separates registered samples from novel-class candidates;
-- **Capacity-Aware Novel-Class Assignment (CANA):** balanced, label-free
-  assignment of rejected candidates to the available emerging-class slots;
+- **Known-K novel-class discovery:** grouping of rejected candidates using only
+  the provided session class-count prior, without equal-capacity or support-set
+  allocation constraints;
 - **Five-shot novel prototypes:** class representatives constructed from the
   current audio encoder and the labeled support episode;
-- **Dynamic classifier expansion:** session-wise registration of new classes
-  while preserving the previously registered classifier rows.
+- **Dynamic classifier expansion:** session-wise addition of new-class
+  prototypes while preserving all previous classifier rows.
 
 No network access is required during training or evaluation. Datasets,
 checkpoints, Python packages, and optional pretrained artifacts must be available
@@ -78,7 +79,7 @@ preflight.
 
 Set the local dataset and checkpoint variables listed above, then use the single
 release launcher. It fixes the public protocol to current-encoder five-shot
-prototypes, label-free CANA alignment, and independently reset repeats:
+prototypes, known-class-count discovery, and independently reset repeats:
 
 ```bash
 bash scripts/run_balance.sh ls100
